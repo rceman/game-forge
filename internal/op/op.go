@@ -137,3 +137,18 @@ func CwdFrom(ctx context.Context) string {
 	v, _ := ctx.Value(cwdKey{}).(string)
 	return v
 }
+
+// runKey carries the daemon's run identity so a handler's Core can group the
+// resources it creates under the same id the stream reports.
+type runKey struct{}
+
+// WithRunID records the daemon run id on a request context.
+func WithRunID(ctx context.Context, runID string) context.Context {
+	return context.WithValue(ctx, runKey{}, runID)
+}
+
+// RunIDFrom returns the daemon run id, or "" when unset.
+func RunIDFrom(ctx context.Context) string {
+	v, _ := ctx.Value(runKey{}).(string)
+	return v
+}

@@ -37,6 +37,9 @@ type Options struct {
 	RunID string
 	// Project is the owning project id.
 	Project string
+	// ProjectKey is the stable per-checkout project identity. A reachable URL
+	// already owned by a DIFFERENT key is a conflict, not a reuse.
+	ProjectKey string
 	// Lease is the resource lease. Zero means no lease.
 	Lease time.Duration
 	// Registry receives the owned-resource record. Optional.
@@ -83,6 +86,9 @@ func Ensure(ctx context.Context, opts Options) (*Server, error) {
 		opts.ReadyTimeout = 60 * time.Second
 	}
 	if Reachable(ctx, opts.URL, 1500*time.Millisecond) {
+		if err := checkForeignOwned(opts); err != nil {
+			return nil, err
+		}
 		return &Server{name: opts.Name, url: opts.URL, owned: false}, nil
 	}
 	if len(opts.Command) == 0 {
@@ -136,15 +142,16 @@ func (s *Server) register(opts Options) {
 	if s.reg == nil {
 		return
 	}
-	s.id = fmt.Sprintf("server-%s-%d", opts.Name, s.cmd.Process.Pid)
+	s.id = fmt.Sprintf("server-%s-%s-%d", opts.ProjectKey, opts.Name, s.cmd.Process.Pid)
 	res := &process.Resource{
-		ID:       s.id,
-		RunID:    opts.RunID,
-		Project:  opts.Project,
-		Kind:     process.KindServer,
-		Provider: "local",
-		PID:      s.cmd.Process.Pid,
-		Metadata: map[string]string{"url": opts.URL, "name": opts.Name},
+		ID:         s.id,
+		RunID:      opts.RunID,
+		Project:    opts.Project,
+		ProjectKey: opts.ProjectKey,
+		Kind:       process.KindServer,
+		Provider:   "local",
+		PID:        s.cmd.Process.Pid,
+		Metadata:   map[string]string{"url": opts.URL, "name": opts.Name},
 	}
 	if pgid := processGroupID(s.cmd); pgid > 0 {
 		res.Metadata["pgid"] = strconv.Itoa(pgid)
@@ -165,6 +172,28 @@ func (s *Server) Stop() {
 	if s.reg != nil && s.id != "" {
 		_ = s.reg.Remove(s.id)
 	}
+}
+
+// checkForeignOwned reports a conflict when the reachable URL is already a
+// Game Forge-owned server belonging to a different project. A same-project or
+// unowned endpoint may be reused.
+func checkForeignOwned(opts Options) error {
+	if opts.Registry == nil || opts.ProjectKey == "" {
+		return nil
+	}
+	all, err := opts.Registry.List()
+	if err != nil {
+		return nil
+	}
+	for _, r := range all {
+		if r.Kind != process.KindServer || r.Metadata["url"] != opts.URL {
+			continue
+		}
+		if r.ProjectKey != "" && r.ProjectKey != opts.ProjectKey {
+			return fmt.Errorf("server %q: %s is already in use by project %q", opts.Name, opts.URL, r.ProjectKey)
+		}
+	}
+	return nil
 }
 
 // Reachable reports whether url answers any HTTP request.

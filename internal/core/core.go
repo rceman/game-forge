@@ -12,6 +12,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,13 +114,21 @@ type Core struct {
 	m     *project.Manifest
 	mErr  error
 
-	release func()
+	release    func()
+	newBrowser func(cfg *config.Config, ns string) browser.Provider
 }
 
 var runCounter atomic.Int64
 
 // New builds a Core for one request whose cwd is the caller's.
 func New(rt *Runtime, cwd string) (*Core, error) {
+	return newCore(rt, cwd, "")
+}
+
+// newCore builds a Core, using runID as its resource-ownership group when
+// given (the daemon passes its stream run id so `ps` correlates resources to
+// the run that created them).
+func newCore(rt *Runtime, cwd, runID string) (*Core, error) {
 	if rt == nil {
 		rt = NewRuntime(false)
 	}
@@ -141,14 +150,18 @@ func New(rt *Runtime, cwd string) (*Core, error) {
 	if rt.KeepAlive {
 		lease = rt.IdleTTL
 	}
+	if runID == "" {
+		runID = fmt.Sprintf("%d-%d-%d", time.Now().UTC().Unix(), os.Getpid(), runCounter.Add(1))
+	}
 	c := &Core{
-		rt:     rt,
-		cwd:    cwd,
-		cfg:    cfg,
-		reg:    reg,
-		runID:  fmt.Sprintf("%d-%d-%d", time.Now().UTC().Unix(), os.Getpid(), runCounter.Add(1)),
-		logDir: logDir,
-		lease:  lease,
+		rt:         rt,
+		cwd:        cwd,
+		cfg:        cfg,
+		reg:        reg,
+		runID:      runID,
+		logDir:     logDir,
+		lease:      lease,
+		newBrowser: func(cfg *config.Config, ns string) browser.Provider { return browser.NewAgentBrowser(cfg, ns) },
 	}
 	// The run is in-flight for the Core's lifetime so housekeeping never
 	// reclaims resources it is actively using.
@@ -209,15 +222,58 @@ func (c *Core) namespaceFor(suffix string) string {
 	return prefix + "-" + suffix
 }
 
+// projectKey returns the stable per-checkout project identity: the human
+// project id plus a short hash of the canonical project root, e.g.
+// "spin-tower-a81c92". Two checkouts may share a project.id but never share a
+// key, so daemon-owned resources stay project-isolated.
+func (c *Core) projectKey() (string, error) {
+	m, err := c.manifest()
+	if err != nil {
+		return "", err
+	}
+	return projectKeyFor(m), nil
+}
+
+// projectKeyFor derives the project key from a manifest.
+func projectKeyFor(m *project.Manifest) string {
+	root := canonicalRoot(m.Root)
+	sum := sha256.Sum256([]byte(root))
+	return fmt.Sprintf("%s-%x", sanitize(m.Project.ID), sum[:3])
+}
+
+// canonicalRoot resolves symlinks and absolutizes a project root so the same
+// checkout always hashes identically.
+func canonicalRoot(root string) string {
+	if p, err := filepath.EvalSymlinks(root); err == nil {
+		root = p
+	}
+	if p, err := filepath.Abs(root); err == nil {
+		root = p
+	}
+	return filepath.Clean(root)
+}
+
+// ownsResource reports whether a registry record belongs to this project.
+// Keyed records match on ProjectKey; a legacy record without a key falls back
+// to the human project id.
+func ownsResource(r *process.Resource, key, id string) bool {
+	if r.ProjectKey != "" {
+		return r.ProjectKey == key
+	}
+	return r.Project == id
+}
+
 // sharedNamespace returns the stable namespace for the reused daemon-owned
-// browser session of a project. Unmuted sessions get their own namespace so a
-// diagnostic override never relaunches a normal run's browser.
+// browser session of a project. It is keyed by project root so two checkouts
+// with the same project.id never attach to one agent-browser namespace.
+// Unmuted sessions get their own namespace so a diagnostic override never
+// relaunches a normal run's browser.
 func (c *Core) sharedNamespace() (string, error) {
 	m, err := c.manifest()
 	if err != nil {
 		return "", err
 	}
-	id := sanitize(m.Project.ID)
+	id := projectKeyFor(m)
 	if c.unmuted {
 		id += "-unmuted"
 	}
@@ -293,6 +349,7 @@ func (c *Core) ensureServer(ctx context.Context, kind string, lease time.Duratio
 	if err != nil {
 		return nil, err
 	}
+	key := projectKeyFor(m)
 	if lease <= 0 {
 		lease = c.lease
 	}
@@ -305,19 +362,25 @@ func (c *Core) ensureServer(ctx context.Context, kind string, lease time.Duratio
 		LogDir:       c.logDir,
 		RunID:        c.runID,
 		Project:      m.Project.ID,
+		ProjectKey:   key,
 		Lease:        lease,
 		Registry:     c.reg,
 	})
 	if err != nil {
 		return nil, err
 	}
-	c.refreshServerLease(kind, lease)
+	c.refreshServerLease(kind, key, lease)
 	return srv, nil
 }
 
-// refreshServerLease extends the lease of the registered record for kind.
-func (c *Core) refreshServerLease(kind string, lease time.Duration) {
+// refreshServerLease extends the lease of this project's registered record
+// for kind. Another project's same-named server is never touched.
+func (c *Core) refreshServerLease(kind, key string, lease time.Duration) {
 	if lease <= 0 {
+		return
+	}
+	m, err := c.manifest()
+	if err != nil {
 		return
 	}
 	all, err := c.reg.List()
@@ -325,25 +388,37 @@ func (c *Core) refreshServerLease(kind string, lease time.Duration) {
 		return
 	}
 	for _, r := range all {
-		if r.Kind == process.KindServer && r.Metadata["name"] == kind {
-			r.Expires = time.Now().UTC().Add(lease)
-			_ = c.reg.Register(r)
+		if r.Kind != process.KindServer || r.Metadata["name"] != kind {
+			continue
 		}
+		if !ownsResource(r, key, m.Project.ID) {
+			continue
+		}
+		r.Expires = time.Now().UTC().Add(lease)
+		_ = c.reg.Register(r)
 	}
 }
 
-// stopNamedServer stops the project's named server if it is registered and
-// owned. It reports the record that was stopped, if any.
+// stopNamedServer stops this project's named server if it is registered and
+// owned. A same-named server belonging to another project is never stopped.
 func (c *Core) stopNamedServer(kind string) (id string, pid int, stopped bool, err error) {
+	m, err := c.manifest()
+	if err != nil {
+		return "", 0, false, err
+	}
 	if _, err := c.serverSpec(kind); err != nil {
 		return "", 0, false, err
 	}
+	key := projectKeyFor(m)
 	all, err := c.reg.List()
 	if err != nil {
 		return "", 0, false, err
 	}
 	for _, r := range all {
 		if r.Kind != process.KindServer || r.Metadata["name"] != kind {
+			continue
+		}
+		if !ownsResource(r, key, m.Project.ID) {
 			continue
 		}
 		pgid, _ := strconv.Atoi(r.Metadata["pgid"])
@@ -385,22 +460,28 @@ func (c *Core) openBrowserMode(ctx context.Context, url string, waitBridge bool)
 		}
 		shared = true
 	}
+	// The namespace lock is held for the WHOLE logical browser operation, not
+	// just the open: one shared session cannot serve two concurrent
+	// navigations. The returned cleanup releases it; every error path unlocks
+	// exactly once.
 	unlock := c.rt.lockBrowser(ns)
-	defer unlock()
 
-	provider := browser.NewAgentBrowser(c.cfg, ns)
+	provider := c.newBrowser(c.cfg, ns)
 	if c.unmuted {
-		provider.SetUnmuted(true)
+		if sp, ok := provider.(interface{ SetUnmuted(bool) }); ok {
+			sp.SetUnmuted(true)
+		}
 	}
 	res := &process.Resource{
-		ID:        "browser-" + ns,
-		RunID:     c.runID,
-		Project:   m.Project.ID,
-		Kind:      process.KindBrowser,
-		Provider:  c.cfg.Browser.Provider,
-		Namespace: ns,
-		Host:      c.cfg.Browser.Host,
-		Expires:   time.Now().UTC().Add(c.lease),
+		ID:         "browser-" + ns,
+		RunID:      c.runID,
+		Project:    m.Project.ID,
+		ProjectKey: projectKeyFor(m),
+		Kind:       process.KindBrowser,
+		Provider:   c.cfg.Browser.Provider,
+		Namespace:  ns,
+		Host:       c.cfg.Browser.Host,
+		Expires:    time.Now().UTC().Add(c.lease),
 	}
 	var (
 		sess *browser.Session
@@ -412,19 +493,23 @@ func (c *Core) openBrowserMode(ctx context.Context, url string, waitBridge bool)
 		sess, serr = browser.OpenSessionRaw(ctx, provider, url, Viewport)
 	}
 	if serr != nil {
+		unlock()
 		return nil, nil, fmt.Errorf("open browser at %s: %w", url, serr)
 	}
 	if err := c.reg.Register(res); err != nil {
 		_ = sess.Close(context.Background())
+		unlock()
 		return nil, nil, fmt.Errorf("register browser: %w", err)
 	}
 	if shared {
-		// A daemon-owned session is leased for reuse, not closed per request.
-		return sess, func() {}, nil
+		// A daemon-owned session is leased for reuse: cleanup releases the
+		// operation lock but must NOT close the reusable browser.
+		return sess, unlock, nil
 	}
 	cleanup := func() {
 		_ = sess.Close(context.Background())
 		_ = c.reg.Remove(res.ID)
+		unlock()
 	}
 	return sess, cleanup, nil
 }

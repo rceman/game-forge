@@ -97,7 +97,9 @@ Compact but readable. `POST /v1/run` body:
 ```
 
 - `v` — protocol version. Always `1`; any other value → `unsupported_version`.
-- `id` — optional request id, echoed on replies and events.
+- `id` — optional request id, echoed on replies and events. When omitted the
+  daemon assigns a unique `q_<inc>_<n>` so a correlation identifier is never
+  ambiguously empty.
 - `op` — canonical operation name.
 - `cwd` — the caller's working directory. The daemon has its own, so project
   discovery is told where the caller was. Transport metadata, not semantics.
@@ -138,15 +140,18 @@ For a long-running operation, send `Accept: application/x-ndjson`. The daemon
 replies `Content-Type: application/x-ndjson` with one JSON object per line:
 
 ```json
-{"id":"42","ev":"start","run":"r1"}
+{"id":"42","ev":"start","run":"r_a1b2c3_1"}
 {"id":"42","ev":"stage","name":"check","status":"pass","ms":1180,"data":"exit=0"}
 {"id":"42","ev":"artifact","kind":"image","ref":"shot","path":"/tmp/shot.png"}
-{"id":"42","ev":"done","run":"r1","status":"pass","data":{...},"code":0}
+{"id":"42","ev":"done","run":"r_a1b2c3_1","status":"pass","data":{...},"code":0}
 ```
 
 Event types: `start`, `stage`, `artifact`, `done`.
 
-- `start` — the run began; carries `run`.
+- `start` — the run began; carries `run`, the daemon-assigned run id
+  `r_<incarnation>_<n>`: unique per run, stable for every event of one stream,
+  and distinct across daemon restarts (the incarnation differs). It never
+  carries token material.
 - `stage` — one named step finished; `name`, `status` (`pass`/`fail`), `ms`,
   and a short `data` detail.
 - `artifact` — a large result by reference (`kind`, `ref`, `path`), never by

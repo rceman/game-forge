@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +12,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rceman/game-forge/internal/core"
@@ -24,14 +29,16 @@ const HousekeepingInterval = 15 * time.Second
 // Server is the control daemon. It serves the Operation Registry over
 // loopback HTTP and owns the housekeeping loop.
 type Server struct {
-	rt      *core.Runtime
-	reg     *op.Registry
-	token   string
-	logger  *log.Logger
-	done    chan struct{}
-	stopCh  chan struct{}
-	once    bool
-	serveFn func(ln net.Listener, h http.Handler) error
+	rt          *core.Runtime
+	reg         *op.Registry
+	token       string
+	logger      *log.Logger
+	done        chan struct{}
+	stopCh      chan struct{}
+	once        bool
+	incarnation string
+	runSeq      atomic.Int64
+	serveFn     func(ln net.Listener, h http.Handler) error
 }
 
 // NewServer builds a daemon around a Runtime and registry.
@@ -40,17 +47,79 @@ func NewServer(rt *core.Runtime, reg *op.Registry, logger *log.Logger) *Server {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Server{
-		rt:     rt,
-		reg:    reg,
-		logger: logger,
-		done:   make(chan struct{}),
-		stopCh: make(chan struct{}),
+		rt:          rt,
+		reg:         reg,
+		logger:      logger,
+		done:        make(chan struct{}),
+		stopCh:      make(chan struct{}),
+		incarnation: newIncarnation(),
 	}
+}
+
+// newIncarnation returns a short random identity for this daemon process. It
+// is NOT derived from the bearer token; run ids must never carry token
+// material.
+func newIncarnation() string {
+	b := make([]byte, 3)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%x", os.Getpid()&0xffff)
+	}
+	return hex.EncodeToString(b)
+}
+
+// nextID returns a compact, per-incarnation-unique id, e.g. "r_a1b2c3_4".
+// Concurrent streams never share one, and ids are unique across restarts
+// because the incarnation differs.
+func (s *Server) nextID(prefix string) string {
+	return fmt.Sprintf("%s_%s_%d", prefix, s.incarnation, s.runSeq.Add(1))
+}
+
+// acquireLifetimeLock claims daemon ownership for this process's lifetime.
+// The file carries the owning pid so a crashed daemon's stale lock is
+// recovered rather than waited on forever.
+func acquireLifetimeLock() (func(), error) {
+	path, err := OwnedLockPath()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	for tries := 0; tries < 20; tries++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			return func() {
+				f.Close()
+				_ = os.Remove(path)
+			}, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		// The lock exists: a live owner means another daemon is genuinely
+		// running; a dead one leaves a stale file we reclaim.
+		data, _ := os.ReadFile(path)
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+		if pid > 0 && processAlive(pid) {
+			return nil, fmt.Errorf("game-forged already running (pid %d)", pid)
+		}
+		_ = os.Remove(path)
+	}
+	return nil, fmt.Errorf("could not claim daemon ownership")
 }
 
 // Serve binds a dynamic loopback port, writes discovery state, runs startup
 // reconciliation and the housekeeping loop, and serves until stopped.
 func (s *Server) Serve() error {
+	// Only one daemon incarnation may own discovery/control at once. The
+	// lifetime lock is enforced by the worker itself, not just by the CLI's
+	// startup coordination, so two directly launched serves converge.
+	release, err := acquireLifetimeLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	tok, err := newToken()
 	if err != nil {
 		return err
@@ -297,6 +366,12 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, verr)
 		return
 	}
+	// A request id is never ambiguously empty: when the client omits one, the
+	// daemon assigns a unique "q_<inc>_<n>" so replies/events always carry a
+	// correlation identifier.
+	if req.ID == "" {
+		req.ID = s.nextID("q")
+	}
 
 	ctx := op.WithCwd(r.Context(), req.Cwd)
 	stream := strings.Contains(r.Header.Get("Accept"), "application/x-ndjson")
@@ -304,7 +379,9 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		s.streamRun(w, ctx, req, o)
 		return
 	}
-	s.simpleRun(w, ctx, req, o)
+	// A non-streamed run still gets a unique run id so the resources it owns
+	// group under a daemon-correlatable identity.
+	s.simpleRun(w, op.WithRunID(ctx, s.nextID("r")), req, o)
 }
 
 // simpleRun executes an operation and returns one compact reply.
@@ -338,7 +415,7 @@ func (s *Server) streamRun(w http.ResponseWriter, ctx context.Context, req op.Re
 	fl, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 
-	runID := "r1"
+	runID := s.nextID("r")
 	emit := func(ev op.Event) {
 		if ev.ID == "" {
 			ev.ID = req.ID
@@ -354,7 +431,7 @@ func (s *Server) streamRun(w http.ResponseWriter, ctx context.Context, req op.Re
 	}
 	sink := &eventSink{emit: emit, run: runID}
 	emit(op.Event{Ev: op.EvStart, Run: runID})
-	data, err := o.Handler(ctx, req.Args, sink)
+	data, err := o.Handler(op.WithRunID(ctx, runID), req.Args, sink)
 	done := op.Event{Ev: op.EvDone, Run: runID}
 	code := 0
 	if data != nil {

@@ -59,6 +59,17 @@ func LockPath() (string, error) {
 	return filepath.Join(dir, "daemon.lock"), nil
 }
 
+// OwnedLockPath returns the daemon-lifetime ownership lock path. The running
+// daemon holds it for its whole life; it is what makes two directly launched
+// `daemon serve` workers converge on one incarnation.
+func OwnedLockPath() (string, error) {
+	dir, err := RunDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon-owned.lock"), nil
+}
+
 // LogPath returns the daemon log path.
 func LogPath() (string, error) {
 	dir, err := config.StateDir()

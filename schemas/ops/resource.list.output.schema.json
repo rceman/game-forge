@@ -13,6 +13,7 @@
           "id": { "type": "string" },
           "runId": { "type": "string" },
           "project": { "type": "string" },
+          "projectKey": { "type": "string" },
           "kind": { "type": "string" },
           "provider": { "type": "string" },
           "namespace": { "type": "string" },

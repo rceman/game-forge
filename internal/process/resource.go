@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,8 +32,12 @@ type Resource struct {
 	ID string `json:"id"`
 	// RunID groups resources owned by one Game Forge invocation.
 	RunID string `json:"run_id"`
-	// Project is the owning project id, or "" for machine-scoped resources.
+	// Project is the owning project's human id, or "" for machine-scoped
+	// resources.
 	Project string `json:"project,omitempty"`
+	// ProjectKey is the stable per-checkout identity ("<id>-<roothash>") used
+	// for ownership checks. Two checkouts may share Project but never a key.
+	ProjectKey string `json:"project_key,omitempty"`
 	// Kind is one of the Kind* constants.
 	Kind string `json:"kind"`
 	// Provider names the owning provider, e.g. "agent-browser".
@@ -56,9 +61,12 @@ func (r *Resource) Expired(now time.Time) bool {
 	return !r.Expires.IsZero() && !now.Before(r.Expires)
 }
 
-// Registry is a durable collection of owned resources.
+// Registry is a durable collection of owned resources. Mutations are
+// serialized in-process; commits are atomic renames so readers never observe
+// a partial record.
 type Registry struct {
 	dir string
+	mu  sync.Mutex
 }
 
 // Open returns the registry rooted at dir, creating it if needed.
@@ -78,6 +86,9 @@ func (r *Registry) path(id string) string {
 }
 
 // Register writes a resource record, assigning defaults for missing fields.
+// Concurrent writers are serialized and each write goes through its own
+// uniquely named temp file, so no two registrations race over a shared
+// "<id>.json.tmp".
 func (r *Registry) Register(res *Resource) error {
 	if res.ID == "" {
 		return fmt.Errorf("resource id is required")
@@ -95,11 +106,24 @@ func (r *Registry) Register(res *Resource) error {
 	if err != nil {
 		return fmt.Errorf("encode resource: %w", err)
 	}
-	tmp := r.path(res.ID) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tmp, err := os.CreateTemp(r.dir, res.ID+".*.tmp")
+	if err != nil {
 		return fmt.Errorf("write resource: %w", err)
 	}
-	if err := os.Rename(tmp, r.path(res.ID)); err != nil {
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return fmt.Errorf("write resource: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("write resource: %w", err)
+	}
+	if err := os.Rename(tmpName, r.path(res.ID)); err != nil {
+		os.Remove(tmpName)
 		return fmt.Errorf("commit resource: %w", err)
 	}
 	return nil
@@ -141,6 +165,8 @@ func (r *Registry) Get(id string) (*Resource, error) {
 
 // Remove deletes a resource record.
 func (r *Registry) Remove(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err := os.Remove(r.path(id)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove resource %s: %w", id, err)
 	}

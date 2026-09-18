@@ -62,7 +62,7 @@ func Register(r *op.Registry, rt *Runtime) error {
 // core builds a per-request Core. The caller's cwd comes from the request
 // context so the daemon's own directory never leaks into project discovery.
 func (rt *Runtime) core(ctx context.Context) (*Core, error) {
-	return New(rt, op.CwdFrom(ctx))
+	return newCore(rt, op.CwdFrom(ctx), op.RunIDFrom(ctx))
 }
 
 // toErr converts an arbitrary error into the structured wire error. *op.Error
@@ -982,18 +982,30 @@ func (rt *Runtime) serverReport(ctx context.Context, raw json.RawMessage, stop b
 		return nil, toErr(err)
 	}
 	defer c.Close()
+	m, err := c.manifest()
+	if err != nil {
+		return nil, toErr(err)
+	}
 	spec, err := c.serverSpec(kind)
 	if err != nil {
 		return nil, toErr(err)
 	}
+	key := projectKeyFor(m)
 	out := serverStateOut{Server: kind, URL: spec.URL}
 	all, err := c.reg.List()
 	if err != nil {
 		return nil, toErr(err)
 	}
 	found := false
+	foreign := ""
 	for _, r := range all {
 		if r.Kind != process.KindServer || r.Metadata["name"] != kind {
+			continue
+		}
+		if !ownsResource(r, key, m.Project.ID) {
+			// A same-named server owned by another project. Note it for the
+			// report but never stop or lease it as ours.
+			foreign = r.ProjectKey
 			continue
 		}
 		found = true
@@ -1010,12 +1022,15 @@ func (rt *Runtime) serverReport(ctx context.Context, raw json.RawMessage, stop b
 		out.Owned = true
 		out.State = "owned"
 	}
-	if !found {
-		if out.URL != "" && server.Reachable(ctx, out.URL, 1500*time.Millisecond) {
-			out.State = "reachable, not owned by game-forge"
-		} else {
-			out.State = "not running"
-		}
+	if found {
+		return out, nil
+	}
+	if foreign != "" {
+		out.State = "running, owned by project " + foreign
+	} else if out.URL != "" && server.Reachable(ctx, out.URL, 1500*time.Millisecond) {
+		out.State = "reachable, not owned by game-forge"
+	} else {
+		out.State = "not running"
 	}
 	return out, nil
 }
@@ -1023,16 +1038,17 @@ func (rt *Runtime) serverReport(ctx context.Context, raw json.RawMessage, stop b
 // ---- resource.* -------------------------------------------------------------
 
 type resourceOut struct {
-	ID        string `json:"id"`
-	RunID     string `json:"runId,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Kind      string `json:"kind"`
-	Provider  string `json:"provider"`
-	Namespace string `json:"namespace,omitempty"`
-	PID       int    `json:"pid,omitempty"`
-	Host      string `json:"host,omitempty"`
-	State     string `json:"state"`
-	Expires   string `json:"expires,omitempty"`
+	ID         string `json:"id"`
+	RunID      string `json:"runId,omitempty"`
+	Project    string `json:"project,omitempty"`
+	ProjectKey string `json:"projectKey,omitempty"`
+	Kind       string `json:"kind"`
+	Provider   string `json:"provider"`
+	Namespace  string `json:"namespace,omitempty"`
+	PID        int    `json:"pid,omitempty"`
+	Host       string `json:"host,omitempty"`
+	State      string `json:"state"`
+	Expires    string `json:"expires,omitempty"`
 }
 
 func (rt *Runtime) resourceList(ctx context.Context, _ json.RawMessage, _ op.Sink) (any, error) {
@@ -1053,7 +1069,7 @@ func (rt *Runtime) resourceList(ctx context.Context, _ json.RawMessage, _ op.Sin
 			st = "expired"
 		}
 		e := resourceOut{
-			ID: r.ID, RunID: r.RunID, Project: r.Project, Kind: r.Kind,
+			ID: r.ID, RunID: r.RunID, Project: r.Project, ProjectKey: r.ProjectKey, Kind: r.Kind,
 			Provider: r.Provider, Namespace: r.Namespace, PID: r.PID, Host: r.Host, State: st,
 		}
 		if !r.Expires.IsZero() {
