@@ -103,19 +103,46 @@ A browser-capable project exposes a small, generic bridge on the page:
 window.__gameForge = {
   capabilities(): { contract: "game-forge/v1", ops: [...] },
   scenarioList(): [...],
-  scenarioLoad(id, params): ...,
+  scenarioDescribe(id): ...,
+  scenarioRun(id, options): ...,
   advance(ticks): ...,
   snapshot(): ...,
+  digest(): ...,
   diagnostics(): ...,
   metrics(): ...,
+  region(name): ...,
+  visual: { list(): [...], load(case, options): ... },
+  benchmark(frames): ...,
+  checks: { ... },   // project-owned assertions Game Forge invokes and reports
 };
 ```
 
 The bridge knows the **contract**. It does not know agent-browser, CDP,
 PowerShell, Windows, or Chrome lifecycle. Game Forge drives those externally.
 
+`checks` is deliberately open-ended: it exposes the project's own product
+assertions (UI flow, lifecycle, presentation independence, audio, diagnostics
+views). Game Forge executes them, times them and propagates their pass/fail
+status without understanding what they mean.
+
 The minimum surface is whatever the first consumer actually needs; it grows only
 when a real consumer requires it.
+
+## Browser audio output
+
+Game Forge suppresses physical audio output for every managed browser session
+(`--mute-audio` on the Chrome/agent-browser provider). This is a **provider-level**
+guarantee, not a project concern:
+
+- the game's own mute state (`toggleMute`, `setMuted`, persisted preference) is
+  never touched by Game Forge;
+- the page's `AudioContext` remains active, cue generation and rate limiting keep
+  running, and audio counters stay testable;
+- only system playback is suppressed.
+
+Projects opt out per-invocation with `--unmuted`, or machine-wide with
+`browser.agent_browser.unmuted: true`. A project must not contain
+provider-specific mute flags.
 
 ## Versioning
 

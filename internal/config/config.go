@@ -43,6 +43,9 @@ type AgentBrowser struct {
 	Chrome string `yaml:"chrome"`
 	// Headless selects headless mode. Defaults to true.
 	Headless bool `yaml:"headless"`
+	// Unmuted disables Game Forge's default browser audio-output suppression.
+	// Automated runs are silent by default; this is a diagnostic opt-in.
+	Unmuted bool `yaml:"unmuted"`
 	// NamespacePrefix prefixes generated agent-browser namespaces so Game
 	// Forge can identify and reclaim the resources it owns.
 	NamespacePrefix string `yaml:"namespace_prefix"`
@@ -67,6 +70,15 @@ func Path() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "config.yaml"), nil
+}
+
+// StateDir returns the durable state directory (~/.game-forge/state).
+func StateDir() (string, error) {
+	dir, err := Dir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "state"), nil
 }
 
 // Default returns the built-in configuration used when no config file exists.

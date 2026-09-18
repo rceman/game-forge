@@ -51,9 +51,46 @@ func Run(args []string) int {
 		return cmdPs(rest)
 	case "gc":
 		return cmdGC(rest)
+	case "tick":
+		return cmdTick(rest)
+	case "scheduler":
+		return cmdScheduler(rest)
 	case "project":
 		return cmdProject(rest)
+	case "scenario":
+		return cmdScenario(rest)
+	case "shot":
+		return cmdShot(rest)
+	case "eval":
+		return cmdEval(rest)
+	case "sweep":
+		return cmdSweep(rest)
+	case "gpu":
+		return cmdGPU(rest)
+	case "test":
+		return cmdProfile("test", rest)
+	case "verify":
+		return cmdProfile("verify", rest)
+	case "build":
+		return cmdProfile("build", rest)
+	case "profile":
+		name := ""
+		if len(rest) > 0 {
+			name = rest[0]
+			rest = rest[1:]
+		}
+		if name == "" {
+			fmt.Fprintln(os.Stderr, "game-forge profile: expected a profile name")
+			return ExitUsage
+		}
+		return cmdProfile(name, rest)
 	default:
+		// Any name the project declares as a profile is runnable directly.
+		if h, err := newHarness(); err == nil {
+			if _, ok := h.m.Profile(cmd); ok {
+				return cmdProfile(cmd, rest)
+			}
+		}
 		fmt.Fprintf(os.Stderr, "game-forge: unknown command %q\n\n", cmd)
 		printUsage(os.Stderr)
 		return ExitUsage
@@ -65,13 +102,31 @@ func printUsage(w io.Writer) {
 
 Usage: game-forge <command> [options]
 
-Commands:
-  doctor              Validate configuration and the browser provider
-  project info        Show the nearest project manifest
-  ps                  List resources owned by Game Forge
-  gc                  Reclaim expired owned resources
-  version             Print the Game Forge version
-  help                Show this help
+Project:
+  project info                 Show the nearest project manifest
+  scenario list                List the project's scenarios
+  scenario describe <id>       Describe one scenario
+  scenario run <id>            Run a scenario headlessly (--browser for the browser)
+  scenario compare <id|--all>  Compare headless and browser authoritative output
+  shot <case>                  Deterministic screenshot of a visual case
+  sweep                        Load every visual case and report failures
+  test                         Run the project's "test" profile
+  verify [full]                Run the project's "verify" profile
+
+Browser & GPU:
+  doctor                       Validate configuration and the browser provider
+  gpu                          Verify the real GPU renderer and benchmark
+
+Resources:
+  ps                           List resources owned by Game Forge
+  gc                           Reclaim expired owned resources
+  tick                         Scheduler entry point (idempotent cleanup)
+  scheduler install|status|uninstall
+                               Manage the per-user cleanup schedule
+
+Other:
+  version                      Print the Game Forge version
+  help                         Show this help
 
 Run "game-forge <command> -h" for command-specific options.
 `)
@@ -84,6 +139,7 @@ func cmdDoctor(args []string) int {
 	lease := fs.Duration("lease", 5*time.Minute, "resource lease before it becomes reclaimable")
 	timeout := fs.Duration("timeout", 90*time.Second, "overall timeout")
 	jsonOut := fs.Bool("json", false, "emit JSON")
+	unmuted := fs.Bool("unmuted", false, "do not suppress browser audio output (diagnostic override)")
 	if code, done := fs.parse(args); done {
 		return code
 	}
@@ -124,6 +180,9 @@ func cmdDoctor(args []string) int {
 	}
 
 	provider := browser.NewAgentBrowser(cfg, ns)
+	if *unmuted {
+		provider.SetUnmuted(true)
+	}
 	check, err := provider.Check(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forge doctor: provider check: %v\n", err)
@@ -233,30 +292,38 @@ func cmdGC(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	return runReclaim(ctx, false)
+}
 
+// runReclaim reclaims every expired owned resource. It is idempotent: a second
+// run finds nothing to do.
+func runReclaim(ctx context.Context, quiet bool) int {
 	cfg, _, err := config.LoadDefault()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "game-forge gc: %v\n", err)
+		fmt.Fprintf(os.Stderr, "game-forge: %v\n", err)
 		return ExitFail
 	}
 	reg, err := openRegistry()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "game-forge gc: %v\n", err)
+		fmt.Fprintf(os.Stderr, "game-forge: %v\n", err)
 		return ExitFail
 	}
 	expired, err := reg.Expired(time.Now().UTC())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "game-forge gc: %v\n", err)
+		fmt.Fprintf(os.Stderr, "game-forge: %v\n", err)
 		return ExitFail
 	}
 	if len(expired) == 0 {
-		fmt.Println("nothing to reclaim")
+		if !quiet {
+			fmt.Println("nothing to reclaim")
+		}
 		return ExitOK
 	}
+	h := &harness{cfg: cfg, reg: reg}
 	failed := false
 	for _, r := range expired {
 		fmt.Printf("reclaiming %s (%s %s namespace=%s)\n", r.ID, r.Provider, r.Kind, r.Namespace)
-		if err := reclaim(ctx, cfg, r); err != nil {
+		if err := h.reclaimResource(ctx, r); err != nil {
 			fmt.Fprintf(os.Stderr, "  ! %v\n", err)
 			failed = true
 			continue
@@ -270,17 +337,6 @@ func cmdGC(args []string) int {
 		return ExitFail
 	}
 	return ExitOK
-}
-
-// reclaim releases one owned resource through its provider.
-func reclaim(ctx context.Context, cfg *config.Config, r *process.Resource) error {
-	switch r.Kind {
-	case process.KindBrowser:
-		p := browser.NewAgentBrowser(cfg, r.Namespace)
-		return p.Close(ctx)
-	default:
-		return fmt.Errorf("no reclaimer for kind %q", r.Kind)
-	}
 }
 
 // cmdProject shows the nearest project manifest.

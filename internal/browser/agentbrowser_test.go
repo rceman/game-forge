@@ -3,8 +3,11 @@ package browser
 import (
 	"encoding/binary"
 	"encoding/json"
+	"strings"
 	"testing"
 	"unicode/utf16"
+
+	"github.com/rceman/game-forge/internal/config"
 )
 
 func TestPSQuoteEscapesSingleQuotes(t *testing.T) {
@@ -106,5 +109,85 @@ func TestParseEnvelopeError(t *testing.T) {
 	raw := []byte(`{"success":false,"data":null,"error":"boom"}`)
 	if _, err := parseEnvelope(raw); err == nil {
 		t.Fatal("expected error for success:false")
+	}
+}
+
+func TestLaunchArgsSuppressAudioByDefault(t *testing.T) {
+	p := NewAgentBrowser(config.Default(), "ns")
+	args := p.LaunchArgs()
+	if !strings.Contains(args, "--mute-audio") {
+		t.Fatalf("LaunchArgs must suppress audio output by default, got %q", args)
+	}
+	// agent-browser splits --args on commas, so no flag may contain one.
+	for _, f := range strings.Split(args, ",") {
+		if strings.TrimSpace(f) == "" {
+			t.Fatalf("LaunchArgs has an empty flag: %q", args)
+		}
+	}
+	if !strings.HasPrefix(strings.TrimSpace(args), "--") {
+		t.Fatalf("LaunchArgs must start with a flag: %q", args)
+	}
+}
+
+func TestLaunchArgsUnmutedOverride(t *testing.T) {
+	p := NewAgentBrowser(config.Default(), "ns")
+	p.SetUnmuted(true)
+	if strings.Contains(p.LaunchArgs(), "--mute-audio") {
+		t.Fatalf("unmuted override must not pass --mute-audio, got %q", p.LaunchArgs())
+	}
+}
+
+// TestBaseArgsRepeatLaunchFlags guards a real regression: agent-browser relaunches
+// Chrome with its default flags whenever an invocation omits --args, so the
+// flags must be repeated on every call, not just on the launching one.
+func TestBaseArgsRepeatLaunchFlags(t *testing.T) {
+	p := NewAgentBrowser(config.Default(), "ns")
+	base := p.baseArgs()
+	if !containsSeq(base, "--args", p.LaunchArgs()) {
+		t.Fatalf("baseArgs must carry --args on every invocation, got %q", base)
+	}
+	if idxOf(base, "--args") > idxOf(base, "open") && idxOf(base, "open") >= 0 {
+		t.Fatalf("--args is a global option and must precede the subcommand, got %q", base)
+	}
+	p.SetUnmuted(true)
+	if strings.Contains(p.LaunchArgs(), "--mute-audio") {
+		t.Fatalf("unmuted provider must not suppress audio, got %q", p.baseArgs())
+	}
+}
+
+func containsSeq(args []string, want ...string) bool {
+	at := idxOf(args, want[0])
+	if at < 0 {
+		return false
+	}
+	for i, w := range want {
+		if at+i >= len(args) || args[at+i] != w {
+			return false
+		}
+	}
+	return true
+}
+
+func idxOf(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestConsoleErrorsOnlyErrorLevel(t *testing.T) {
+	data := json.RawMessage(`{"messages":[
+		{"text":"[vite] connecting...","type":"debug"},
+		{"text":"boom","type":"error"},
+		{"text":"careful","type":"warn"}
+	]}`)
+	msgs, ok := typedConsoleErrors(data)
+	if !ok {
+		t.Fatal("typedConsoleErrors should recognise the messages shape")
+	}
+	if len(msgs) != 1 || msgs[0] != "boom" {
+		t.Fatalf("typedConsoleErrors = %v, want [boom]", msgs)
 	}
 }

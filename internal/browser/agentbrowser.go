@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -26,11 +28,13 @@ type AgentBrowser struct {
 	cli       string
 	chrome    string
 	headless  bool
+	unmuted   bool
 	namespace string
 	host      string
 
 	psExe   string        // PowerShell executable (interop or native)
 	timeout time.Duration // per-invocation ceiling
+	tmpDir  string        // cached writable Windows temp dir (WSL path)
 }
 
 // NewAgentBrowser builds an agent-browser provider from machine configuration.
@@ -40,6 +44,7 @@ func NewAgentBrowser(cfg *config.Config, namespace string) *AgentBrowser {
 		cli:       ab.CLI,
 		chrome:    ab.Chrome,
 		headless:  ab.Headless,
+		unmuted:   ab.Unmuted,
 		namespace: namespace,
 		host:      cfg.Browser.Host,
 		psExe:     powershellPath(),
@@ -85,10 +90,20 @@ func (a *AgentBrowser) resolveCLI(ctx context.Context) (string, error) {
 }
 
 // baseArgs returns the flags common to every invocation.
+//
+// The managed Chrome launch flags are repeated on every call, not just on the
+// launching one. agent-browser treats --args as a GLOBAL option (it must precede
+// the subcommand, and a copy after the subcommand is silently ignored) and the
+// daemon relaunches Chrome with its default flags whenever a later invocation
+// omits them. Supplying them once and then calling `set viewport` was enough to
+// lose audio suppression entirely.
 func (a *AgentBrowser) baseArgs() []string {
 	args := []string{"--namespace", a.namespace}
 	if a.chrome != "" {
 		args = append(args, "--executable-path", a.chrome)
+	}
+	if la := a.LaunchArgs(); la != "" {
+		args = append(args, "--args", la)
 	}
 	if !a.headless {
 		// agent-browser defaults to headless; --headed is the explicit opposite.
@@ -140,6 +155,7 @@ func (a *AgentBrowser) Check(ctx context.Context) (*CheckResult, error) {
 	}
 
 	res.OK = len(res.Problems) == 0
+	res.AddDetail("launch args: %s", a.LaunchArgs())
 	return res, nil
 }
 
@@ -159,8 +175,166 @@ func (a *AgentBrowser) version(ctx context.Context) (string, error) {
 
 // Open implements Provider.
 func (a *AgentBrowser) Open(ctx context.Context, url string) error {
-	_, err := a.run(ctx, []string{"open", url})
+	return a.open(ctx, url)
+}
+
+// Navigate implements Provider.
+func (a *AgentBrowser) Navigate(ctx context.Context, url string) error {
+	return a.open(ctx, url)
+}
+
+// open launches the browser with Game Forge's managed flags and navigates.
+func (a *AgentBrowser) open(ctx context.Context, url string) error {
+	args := []string{"open"}
+	if url != "" {
+		args = append(args, url)
+	}
+	_, err := a.run(ctx, args)
 	return err
+}
+
+// LaunchArgs returns the comma-separated Chrome flags Game Forge applies to
+// every managed browser launch.
+//
+// The list MUST stay comma-free: agent-browser splits --args on commas, so a
+// value like --disable-features=A,B would silently shred into two arguments.
+//
+// Automated sessions are silent by default. --mute-audio suppresses physical
+// audio output only: the page's AudioContext stays active, cue generation and
+// rate limiting keep running, and every audio counter remains testable. Game
+// Forge never touches the project's own mute state.
+func (a *AgentBrowser) LaunchArgs() string {
+	flags := []string{
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-background-networking",
+		"--disable-sync",
+		"--disable-default-apps",
+		"--disable-translate",
+		"--disable-component-update",
+		"--no-first-run",
+	}
+	if !a.unmuted {
+		flags = append(flags, "--mute-audio")
+	}
+	return strings.Join(flags, ",")
+}
+
+// SetUnmuted toggles browser audio-output suppression. It exists for the
+// explicit diagnostic override; normal automation leaves it off.
+func (a *AgentBrowser) SetUnmuted(v bool) { a.unmuted = v }
+
+// Reload implements Provider.
+func (a *AgentBrowser) Reload(ctx context.Context) error {
+	_, err := a.run(ctx, []string{"reload"})
+	return err
+}
+
+// SetViewport implements Provider.
+func (a *AgentBrowser) SetViewport(ctx context.Context, width, height int) error {
+	_, err := a.run(ctx, []string{"set", "viewport", strconv.Itoa(width), strconv.Itoa(height)})
+	return err
+}
+
+// Click implements Provider.
+func (a *AgentBrowser) Click(ctx context.Context, selector string) error {
+	_, err := a.run(ctx, []string{"click", selector})
+	return err
+}
+
+// Press implements Provider.
+func (a *AgentBrowser) Press(ctx context.Context, key string) error {
+	_, err := a.run(ctx, []string{"press", key})
+	return err
+}
+
+// PageErrors implements Provider.
+func (a *AgentBrowser) PageErrors(ctx context.Context) ([]string, error) {
+	return a.messages(ctx, "errors")
+}
+
+// ConsoleErrors implements Provider.
+//
+// agent-browser reports every console entry; only error-level entries are
+// failures. debug/info/warn entries (dev-server chatter, HMR notices) are not.
+func (a *AgentBrowser) ConsoleErrors(ctx context.Context) ([]string, error) {
+	raw, err := a.run(ctx, []string{"console"})
+	if err != nil {
+		return nil, err
+	}
+	env, err := parseEnvelope(raw)
+	if err != nil {
+		return nil, err
+	}
+	if msgs, ok := typedConsoleErrors(env.Data); ok {
+		return msgs, nil
+	}
+	var out []string
+	for _, m := range extractMessages(env.Data) {
+		if strings.Contains(strings.ToLower(m), "error") {
+			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+// typedConsoleErrors returns error-level console messages when the payload
+// carries per-entry types.
+func typedConsoleErrors(data json.RawMessage) ([]string, bool) {
+	var obj struct {
+		Messages []struct {
+			Text string `json:"text"`
+			Type string `json:"type"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(data, &obj); err != nil || obj.Messages == nil {
+		return nil, false
+	}
+	out := []string{}
+	for _, m := range obj.Messages {
+		if strings.EqualFold(m.Type, "error") || strings.EqualFold(m.Type, "assert") {
+			out = append(out, m.Text)
+		}
+	}
+	return out, true
+}
+
+// ClearErrors implements Provider.
+func (a *AgentBrowser) ClearErrors(ctx context.Context) error {
+	if _, err := a.run(ctx, []string{"errors", "--clear"}); err != nil {
+		return err
+	}
+	_, err := a.run(ctx, []string{"console", "--clear"})
+	return err
+}
+
+// messages reads an agent-browser diagnostics stream (errors or console).
+func (a *AgentBrowser) messages(ctx context.Context, kind string) ([]string, error) {
+	raw, err := a.run(ctx, []string{kind})
+	if err != nil {
+		return nil, err
+	}
+	env, err := parseEnvelope(raw)
+	if err != nil {
+		return nil, err
+	}
+	return extractMessages(env.Data), nil
+}
+
+// Renderer implements Provider.
+func (a *AgentBrowser) Renderer(ctx context.Context) (*RendererInfo, error) {
+	// Single line on purpose: multi-line arguments do not survive the
+	// PowerShell interop boundary intact.
+	js := `(() => { const c = document.createElement('canvas'); const gl = c.getContext('webgl2') || c.getContext('webgl'); if (!gl) return JSON.stringify({ renderer: 'none' }); const dbg = gl.getExtension('WEBGL_debug_renderer_info'); const o = { vendor: gl.getParameter(gl.VENDOR), renderer: gl.getParameter(gl.RENDERER) }; if (dbg) { o.unmaskedVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL); o.unmaskedRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL); } return JSON.stringify(o); })()`
+	raw, err := a.Eval(ctx, js)
+	if err != nil {
+		return nil, err
+	}
+	var info RendererInfo
+	if err := json.Unmarshal(unwrapJSONString(raw), &info); err != nil {
+		return nil, fmt.Errorf("parse renderer info: %w (%.200s)", err, raw)
+	}
+	return &info, nil
 }
 
 // Eval implements Provider.
@@ -186,17 +360,81 @@ func (a *AgentBrowser) Eval(ctx context.Context, js string) (json.RawMessage, er
 }
 
 // Screenshot implements Provider.
+//
+// The Windows browser writes the PNG, so when Game Forge runs under WSL the
+// target must be on a mounted drive. A target anywhere else (e.g. /tmp) is
+// captured to a Windows temp file and copied back, so callers can name any
+// path.
 func (a *AgentBrowser) Screenshot(ctx context.Context, path string) error {
 	out := path
+	var tempLocal string
 	if a.useInterop() {
-		w, err := toWindowsPath(path)
-		if err != nil {
+		if w, err := toWindowsPath(path); err == nil {
+			out = w
+		} else {
+			dir, err := a.screenshotTempDir(ctx)
+			if err != nil {
+				return err
+			}
+			f, err := os.CreateTemp(dir, "game-forge-shot-*.png")
+			if err != nil {
+				return fmt.Errorf("create screenshot temp: %w", err)
+			}
+			tempLocal = f.Name()
+			f.Close()
+			w, err := toWindowsPath(tempLocal)
+			if err != nil {
+				return err
+			}
+			out = w
+		}
+	}
+	if _, err := a.run(ctx, []string{"screenshot", out}); err != nil {
+		return err
+	}
+	if tempLocal != "" {
+		if err := copyFile(tempLocal, path); err != nil {
 			return err
 		}
-		out = w
+		_ = os.Remove(tempLocal)
 	}
-	_, err := a.run(ctx, []string{"screenshot", out})
-	return err
+	return nil
+}
+
+// screenshotTempDir resolves a writable Windows temp directory as a WSL path.
+func (a *AgentBrowser) screenshotTempDir(ctx context.Context) (string, error) {
+	if a.tmpDir != "" {
+		return a.tmpDir, nil
+	}
+	out, err := exec.CommandContext(ctx, a.psExe, "-NoProfile", "-Command", "Write-Output $env:TEMP").Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve windows temp dir: %w", err)
+	}
+	winTemp := strings.TrimSpace(strings.ReplaceAll(string(out), "\r", ""))
+	wsl, err := fromWindowsPath(winTemp)
+	if err != nil {
+		return "", err
+	}
+	a.tmpDir = wsl
+	return wsl, nil
+}
+
+// copyFile copies src to dst.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("copy to %s: %w", dst, err)
+	}
+	return nil
 }
 
 // Close implements Provider.
@@ -419,10 +657,18 @@ func psQuote(s string) string {
 }
 
 // psJoin quotes an argument list for PowerShell.
+//
+// Windows PowerShell 5.1 does not escape embedded double quotes when passing
+// arguments to a native command: it wraps the value in double quotes and lets
+// the inner ones terminate the string early. Game Forge therefore escapes
+// embedded double quotes itself so the native argument parser (MSVCRT) turns
+// them back into literal quotes. This matters for `eval`, whose JavaScript is
+// full of quotes.
 func psJoin(args []string) string {
 	parts := make([]string, len(args))
 	for i, a := range args {
-		parts[i] = psQuote(a)
+		escaped := strings.ReplaceAll(a, `"`, `\"`)
+		parts[i] = psQuote(escaped)
 	}
 	return strings.Join(parts, " ")
 }
@@ -441,5 +687,92 @@ func toWindowsPath(p string) (string, error) {
 	return strings.ToUpper(drive) + `:\` + strings.ReplaceAll(tail, "/", `\`), nil
 }
 
+// fromWindowsPath converts a Windows path (C:\...) to a WSL mount path.
+func fromWindowsPath(p string) (string, error) {
+	p = strings.TrimSpace(p)
+	if len(p) < 3 || p[1] != ':' || (p[2] != '\\' && p[2] != '/') {
+		return "", fmt.Errorf("path %q is not a windows drive path", p)
+	}
+	drive := strings.ToLower(string(p[0]))
+	tail := strings.ReplaceAll(p[3:], `\`, "/")
+	return "/mnt/" + drive + "/" + tail, nil
+}
+
 // nowMS returns the current time in milliseconds since the epoch.
 func nowMS() int64 { return time.Now().UnixMilli() }
+
+// unwrapJSONString returns the raw bytes, unwrapping a JSON string literal.
+func unwrapJSONString(raw json.RawMessage) json.RawMessage {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return json.RawMessage(s)
+	}
+	return raw
+}
+
+// extractMessages pulls a list of human-readable messages out of an
+// agent-browser diagnostics payload, tolerating several plausible shapes.
+func extractMessages(data json.RawMessage) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(data, &obj) == nil {
+		for _, key := range []string{
+			"errors", "pageErrors", "console", "messages", "logs", "entries", "items", "events",
+		} {
+			if v, ok := obj[key]; ok {
+				if msgs := stringsFromJSON(v); msgs != nil {
+					return msgs
+				}
+			}
+		}
+		for _, v := range obj {
+			if msgs := stringsFromJSON(v); msgs != nil {
+				return msgs
+			}
+		}
+	}
+	if msgs := stringsFromJSON(data); msgs != nil {
+		return msgs
+	}
+	return splitNonEmptyLines(string(unwrapJSONString(data)))
+}
+
+// stringsFromJSON extracts a string slice from an array of strings or objects.
+func stringsFromJSON(raw json.RawMessage) []string {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		var s string
+		if json.Unmarshal(item, &s) == nil {
+			out = append(out, s)
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal(item, &obj) == nil {
+			for _, key := range []string{"message", "text", "msg", "description", "value"} {
+				if v, ok := obj[key].(string); ok {
+					out = append(out, v)
+					break
+				}
+			}
+		}
+	}
+	return out
+}
+
+// splitNonEmptyLines splits text into non-blank, trimmed lines.
+func splitNonEmptyLines(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(strings.Trim(line, "\""))
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}

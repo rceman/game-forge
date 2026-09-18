@@ -29,10 +29,14 @@ Tower infrastructure files must we copy?* The answer should be **zero**.
 
 ## Status
 
-Early. The first vertical slice is proven: machine config is read, the native
-Windows agent-browser provider is resolved and health-checked, a bounded
-open/eval/close round trip runs headlessly, and browser resources are registered
-and reclaimed. See [Roadmap](docs/ROADMAP.md).
+The reusable harness is implemented and consumed by Spin Tower: project
+discovery and configuration, native test/build orchestration, deterministic
+scenario execution headless and in-browser, headless/browser comparison,
+screenshots and visual sweep, browser diagnostics, dev/prod server ownership,
+validation profiles, production smoke, GPU verification and benchmarking,
+owned-resource registry with lease/`gc`/`tick`, and a per-user scheduler. See
+[Roadmap](docs/ROADMAP.md) and the
+[Spin Tower migration matrix](docs/SPIN_TOWER_MIGRATION.md).
 
 ## Configuration
 
@@ -57,6 +61,8 @@ browser:
     cli: 'C:\path\to\agent-browser.cmd'
     chrome: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
     headless: true
+    # Automated runs are silent by default (--mute-audio). Set this to opt out.
+    unmuted: false
     namespace_prefix: game-forge
 ```
 
@@ -85,13 +91,43 @@ adapters:
 ```
 game-forge doctor              # validate config and the browser provider
 game-forge project info        # show the nearest project manifest
+
+game-forge scenario list       # discover scenarios from the adapter
+game-forge scenario describe <id>
+game-forge scenario run <id> [--browser] [--seed p] [--world p] [--ticks N] [--param k=v]
+game-forge scenario compare <id|--all>
+
+game-forge shot <case> [--ticks N] [--region R] [--out P] [--expr '<js>']
+game-forge sweep               # every declared visual case
+game-forge eval [--case c] [--ticks N] [--click sel] [--press key] --expr '<js>'
+game-forge errors              # fresh page/console diagnostics
+game-forge gpu                 # renderer verification + benchmark
+
+game-forge check               # project-declared profiles
+game-forge test
+game-forge build
+game-forge verify              # fast gate
+game-forge verify full         # full acceptance
+game-forge prod                # production build + smoke
+
 game-forge ps                  # list resources owned by Game Forge
 game-forge gc                  # reclaim expired owned resources
+game-forge tick                # idempotent scheduler entry point
+game-forge scheduler install|status|uninstall
+
 game-forge version
 game-forge help
 ```
 
 Exit codes are stable: `0` success, `1` failure, `2` usage error.
+
+### Audio output
+
+Game Forge launches the managed browser with `--mute-audio` by default, so
+automated runs never reach your speakers. This suppresses physical output only:
+the page's `AudioContext`, cue generation and audio counters stay live, so audio
+checks remain meaningful. Pass `--unmuted` to any browser command (or set
+`unmuted: true` in the machine config) to hear it deliberately.
 
 ## Build
 
@@ -109,6 +145,7 @@ Requires Go 1.24+.
 - [Design Principles](docs/DESIGN_PRINCIPLES.md) — reusable-tooling and asset-pipeline principles.
 - [Roadmap](docs/ROADMAP.md) — incremental extraction plan driven by real consumers.
 - [Contract v1](docs/CONTRACT_V1.md) — the versioned project contract.
+- [Spin Tower migration matrix](docs/SPIN_TOWER_MIGRATION.md) — what moved where, and what deliberately stayed.
 
 Spin Tower (`rceman/td-game`) is the first real integration consumer.
 
