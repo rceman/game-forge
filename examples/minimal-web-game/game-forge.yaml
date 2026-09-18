@@ -1,0 +1,18 @@
+contract: game-forge/v1
+
+project:
+  id: minimal-web-game
+  type: web-game
+
+capabilities:
+  simulation: true
+  browser: true
+  visual: true
+
+adapters:
+  simulation:
+    command: [node, adapters/simulate.js]
+    protocol: jsonl
+  browser:
+    command: [node, adapters/browser.js]
+    protocol: jsonl

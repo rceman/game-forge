@@ -1,0 +1,11 @@
+# Build output
+/game-forge
+/bin/
+
+# Local machine state must never be committed
+.game-forge/
+config.yaml
+
+# Editor/OS noise
+.DS_Store
+*.swp
