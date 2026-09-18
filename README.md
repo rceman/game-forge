@@ -98,18 +98,21 @@ game-forge scenario run <id> [--browser] [--seed p] [--world p] [--ticks N] [--p
 game-forge scenario compare <id|--all>
 
 game-forge shot <case> [--ticks N] [--region R] [--out P] [--expr '<js>']
+game-forge pixel <x,y> ...     # sample real rendered pixels (Go image decode)
 game-forge sweep               # every declared visual case
 game-forge eval [--case c] [--ticks N] [--click sel] [--press key] --expr '<js>'
 game-forge errors              # fresh page/console diagnostics
 game-forge gpu                 # renderer verification + benchmark
 
 game-forge check               # project-declared profiles
-game-forge test
+game-forge test [-- <native filter>]
 game-forge build
+game-forge profile <name> [-- <native args>]
 game-forge verify              # fast gate
 game-forge verify full         # full acceptance
 game-forge prod                # production build + smoke
 
+game-forge serve start|status|stop   # own the declared dev/prod server
 game-forge ps                  # list resources owned by Game Forge
 game-forge gc                  # reclaim expired owned resources
 game-forge tick                # idempotent scheduler entry point
@@ -128,6 +131,22 @@ automated runs never reach your speakers. This suppresses physical output only:
 the page's `AudioContext`, cue generation and audio counters stay live, so audio
 checks remain meaningful. Pass `--unmuted` to any browser command (or set
 `unmuted: true` in the machine config) to hear it deliberately.
+
+### agent-browser provider notes
+
+Two agent-browser behaviours are load-bearing, and both are covered by tests:
+
+- `--args` is a **global** option. It must precede the subcommand; a copy after
+  the subcommand is silently ignored. It is also split on commas, so no flag
+  value may contain one.
+- The daemon **relaunches Chrome with its default flags whenever an invocation
+  omits `--args`**. Game Forge therefore repeats the managed flags on *every*
+  call, not just on the launching one. Supplying them once and then calling
+  `set viewport` was enough to lose audio suppression entirely.
+
+A browser-launching call is also expected to write its response before the
+launch finishes, so the provider reads the response and detaches rather than
+killing the launcher immediately.
 
 ## Build
 

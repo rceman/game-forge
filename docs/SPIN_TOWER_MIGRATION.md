@@ -29,10 +29,10 @@ Every command the old `scripts/dev` exposed, and where it lives now.
 | Old command | Original implementation | Class | Game Forge mechanism | Remaining td-game responsibility | Status |
 | --- | --- | --- | --- | --- | --- |
 | `check` | `npx tsc --noEmit` | A | `check` profile (`game-forge check`) | command declaration in `game-forge.yaml` | migrated |
-| `test [pattern]` | `npx vitest run` | A | `test` profile (`game-forge test`) | command declaration | migrated |
+| `test [pattern]` | `npx vitest run` | A | `test` profile (`game-forge test -- <pattern>`) | command declaration | migrated |
 | `build` | `npm run build` | A | `build` profile (`game-forge build`) | command declaration | migrated |
 | `sim <scenario>` | `npx tsx scripts/simulate.ts --scenario` | B | `game-forge scenario run <id>` over the JSONL adapter | scenario definitions, arrangement, checks | migrated |
-| `sim <policy>` / `--list` / `--selfcheck` | `npx tsx scripts/simulate.ts` | C | native command (declared as a profile stage in `verify_full`) | balance policy runner, self-check | retained |
+| `sim <policy>` / `--list` / `--selfcheck` | `npx tsx scripts/simulate.ts` | B | `policy` profile (`game-forge profile policy -- <args>`); Game Forge executes it | balance policy runner | retained |
 | `scenarios` | `scripts/simulate.ts --list` | B | `game-forge scenario list` (discovered from the adapter) | scenario registry | migrated |
 | `scenario <id>` | `scripts/simulate.ts --scenario` | B | `game-forge scenario run <id>` | scenario registry | migrated |
 | `digest [fixture] [ticks]` | inline `ab eval` + `digestModule` | B | `game-forge eval --expr "window.__gameForge.checks.digest(...)"` | digest implementation, bridge check | migrated |
@@ -41,7 +41,7 @@ Every command the old `scripts/dev` exposed, and where it lives now.
 | `colliders <fixture> [ticks]` | `ab eval` (overlay) + `ab screenshot` | B | `game-forge shot --expr "window.__spinTower.setColliderOverlay(true)"` | collider-overlay semantics | migrated |
 | `diag <fixture> [ticks]` | `ab eval` + `diagnostics()` | B | `game-forge eval --expr "window.__gameForge.checks.diag(...)"` | diagnostics object | migrated |
 | `ui <fixture> [ticks]` | `ab eval` + DOM visibility probe | B | `game-forge eval --expr "window.__gameForge.checks.ui(...)"` | UI selectors/overlay semantics | migrated |
-| `pixel <x> <y> ...` | `ab screenshot` + PIL sample | B | `game-forge shot --out <tmp>` then a small PIL sample | pixel-sample helper only | migrated |
+| `pixel <x> <y> ...` | `ab screenshot` + PIL sample | A | `game-forge pixel <x,y> ...` (Go `image/png` decode, no Python) | capture case/region semantics | migrated |
 | `eval [fixture] --expr` | `ready` + `ab eval` | A | `game-forge eval [--case] [--ticks] [--click] [--press] [--reload] --expr` | the expression itself | migrated |
 | `reload` | `ab reload` + bridge probe | A | `game-forge eval --reload --expr ...` | — | migrated |
 | `click <sel>` | `ab click` | A | `game-forge eval --click <sel> --expr ...` | — | migrated |
@@ -53,11 +53,11 @@ Every command the old `scripts/dev` exposed, and where it lives now.
 | `lifecycle [cycles]` | inline `ab eval` | B | `game-forge eval --expr "window.__gameForge.checks.lifecycle(N)"` | reset/restart assertions | migrated |
 | `sound` | inline `ab eval` + synthetic click | B | profile stage with `click: ".start-btn"` (trusted input via the provider) | audio cue assertions | migrated |
 | `present-check [id]` | inline `ab eval` | B | `game-forge eval --expr "window.__gameForge.checks.presentationIndependence(id)"` | clean-vs-noisy digest proof | migrated |
-| `selfcheck` | `scripts/simulate.ts --selfcheck` | C | native command declared as a `verify_full` stage | negative-case scenarios | retained |
+| `selfcheck` | `scripts/simulate.ts --selfcheck` | B | `selfcheck` profile (`game-forge profile selfcheck`), reused by `verify_full` | negative-case scenarios | retained |
 | `prod` | build + `vite preview` + `ab open` + DOM probe | A | `prod` profile (`game-forge prod`) — Game Forge owns the prod server and browser | the production DOM assertions | migrated |
 | `verify` | shell composition of stages | A | `verify` profile (`game-forge verify`) | stage list | migrated |
 | `verify-full` | shell composition of stages | A | `verify_full` profile (`game-forge verify full`) | stage list | migrated |
-| `serve [start\|stop]` | `npm run dev` + `pkill -f vite` | A | declared `server.dev`; Game Forge starts, waits, owns and stops it | server command declaration | migrated |
+| `serve [start\|stop]` | `npm run dev` + `pkill -f vite` | A | `game-forge serve start\|status\|stop`; Game Forge starts, waits, registers, reuses and stops it | server command declaration | migrated |
 | `session [start\|stop]` | `agent-browser open/close` | A | owned by the provider; `game-forge ps` / `game-forge gc` | — | migrated |
 | `browser [status\|stop\|prune]` | daemon/RSS inspection, watchdog control | A | `game-forge ps` / `game-forge gc` | — | migrated |
 | `GPU probe` (implicit in `bench`/prod) | none — manual only | A | `game-forge gpu` | benchmark scenario + budget | migrated |

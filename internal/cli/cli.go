@@ -55,12 +55,16 @@ func Run(args []string) int {
 		return cmdTick(rest)
 	case "scheduler":
 		return cmdScheduler(rest)
+	case "serve":
+		return cmdServe(rest)
 	case "project":
 		return cmdProject(rest)
 	case "scenario":
 		return cmdScenario(rest)
 	case "shot":
 		return cmdShot(rest)
+	case "pixel":
+		return cmdPixel(rest)
 	case "eval":
 		return cmdEval(rest)
 	case "sweep":

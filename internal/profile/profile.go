@@ -32,6 +32,10 @@ type Deps struct {
 	OpenBrowserRaw func(ctx context.Context, url string) (*browser.Session, func(), error)
 	// EnsureServer starts or reuses a declared server ("dev" or "prod").
 	EnsureServer func(ctx context.Context, kind string, lease time.Duration) (*server.Server, error)
+	// Extra is appended to the command of a single-command profile. It is how
+	// a caller forwards a native tool's own filters through Game Forge
+	// instead of shelling out to it directly.
+	Extra []string
 }
 
 // StageResult is the outcome of one stage.
@@ -138,7 +142,11 @@ func (d Deps) runCommand(ctx context.Context, stage project.Stage, timeout time.
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
-	res, err := runner.Run(ctx, d.Root, stage.Command, timeout)
+	command := stage.Command
+	if len(d.Extra) > 0 {
+		command = append(append([]string{}, stage.Command...), d.Extra...)
+	}
+	res, err := runner.Run(ctx, d.Root, command, timeout)
 	if err != nil {
 		return StageResult{Name: stage.Name}, err
 	}

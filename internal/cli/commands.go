@@ -682,6 +682,20 @@ func cmdProfile(profileName string, args []string) int {
 		fmt.Fprintf(os.Stderr, "game-forge %s: project declares no profile %q\n", profileName, profileName)
 		return ExitUsage
 	}
+	// Trailing arguments are forwarded to a single-command profile, so a
+	// native tool's own filters still flow through Game Forge's execution,
+	// timeout and exit-status handling instead of a project-local wrapper.
+	extra := fs.Args()
+	if profileName == "verify_full" && len(extra) > 0 && extra[0] == "full" {
+		extra = extra[1:]
+	}
+	if len(extra) > 0 {
+		stages, _ := h.m.Profile(profileName)
+		if len(stages) != 1 || stages[0].Uses != "" || len(stages[0].Command) == 0 {
+			fmt.Fprintf(os.Stderr, "game-forge %s: profile %q is not a single command, so it accepts no extra arguments\n", profileName, profileName)
+			return ExitUsage
+		}
+	}
 	h.unmuted = *unmuted
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -699,6 +713,7 @@ func cmdProfile(profileName string, args []string) int {
 		EnsureServer: func(ctx context.Context, kind string, lease time.Duration) (*server.Server, error) {
 			return h.ensureServer(ctx, kind, lease)
 		},
+		Extra: extra,
 	}
 	sum, err := profile.Run(ctx, deps, profileName)
 	h.stopOwnedServers()

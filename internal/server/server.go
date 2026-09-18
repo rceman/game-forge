@@ -65,6 +65,14 @@ func (s *Server) Owned() bool { return s.owned }
 // LogPath returns the path to the server log.
 func (s *Server) LogPath() string { return s.logPath }
 
+// PID returns the process id of an owned server, or 0 when reused.
+func (s *Server) PID() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
 // Ensure returns a server for opts.URL, starting one only if the URL is not
 // already reachable. A reused server is not owned and will not be stopped.
 func Ensure(ctx context.Context, opts Options) (*Server, error) {

@@ -79,13 +79,19 @@ func (f *flagSet) parse(args []string) (int, bool) {
 }
 
 // reorder moves flags ahead of positionals, preserving order within each group.
+//
+// Everything after a literal "--" is positional by definition. The terminator
+// is kept in the reordered slice so the standard flag package stops there too;
+// otherwise a positional that happens to start with "-" is parsed as a flag.
 func (f *flagSet) reorder(args []string) []string {
 	var flags, positionals []string
+	terminated := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--":
 			positionals = append(positionals, args[i+1:]...)
+			terminated = true
 			i = len(args)
 		case strings.HasPrefix(a, "-") && a != "-":
 			flags = append(flags, a)
@@ -100,6 +106,9 @@ func (f *flagSet) reorder(args []string) []string {
 		default:
 			positionals = append(positionals, a)
 		}
+	}
+	if terminated {
+		return append(append(flags, "--"), positionals...)
 	}
 	return append(flags, positionals...)
 }
