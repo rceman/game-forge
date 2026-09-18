@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/visual.shot/input",
+  "type": "object",
+  "properties": {
+    "case": { "type": "string" },
+    "ticks": { "type": "integer", "minimum": 0 },
+    "seed": { "type": "string" },
+    "world": { "type": "string" },
+    "out": { "type": "string" },
+    "region": { "type": "string" },
+    "expr": { "type": "string" },
+    "unmuted": { "type": "boolean" },
+    "leaseMs": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

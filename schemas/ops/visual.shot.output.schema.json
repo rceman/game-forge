@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/visual.shot/output",
+  "type": "object",
+  "required": ["case", "ticks", "region", "output", "bytes"],
+  "properties": {
+    "case": { "type": "string" },
+    "ticks": { "type": "integer" },
+    "region": { "type": "string" },
+    "output": { "type": "string" },
+    "bytes": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

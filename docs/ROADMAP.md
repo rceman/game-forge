@@ -96,14 +96,14 @@ Candidate deliverables:
 - leases/TTL;
 - `game-forge ps`;
 - `game-forge gc`;
-- `game-forge tick`;
-- per-user scheduler install/status/uninstall;
-- Windows Scheduled Task backend;
-- Linux per-user timer backend.
+- `game-forge tick`.
 
 Exit criterion:
 
-Abandoned Game Forge-owned browser/server resources are recoverable without killing unrelated user processes and without a permanently running cleanup daemon.
+Abandoned Game Forge-owned browser/server resources are recoverable without
+killing unrelated user processes. Housekeeping is performed by the persistent
+per-user daemon (see the daemon milestone below); the earlier cron/OS-scheduler
+model was retired in favour of it.
 
 ## Milestone 5 — Hardware/GPU acceptance
 
@@ -199,12 +199,28 @@ Architecture rule:
 
 ```text
 CLI ---------\
-MCP ----------> Game Forge Core
+MCP ----------> Operation Registry ---> Game Forge Core
 CI ----------/
-scheduler ---/
+daemon HTTP -/
 ```
 
 MCP must not become the internal game adapter transport.
+
+## Milestone — Daemon + Operation Registry (done)
+
+The persistent per-user `game-forged` daemon is now the lifecycle/housekeeping
+authority, replacing the cron/OS-scheduler model. Delivered:
+
+- loopback-TCP HTTP transport on a dynamic port with bearer auth;
+- atomic `run/daemon.json` discovery with stale recovery;
+- singleton startup coordination (lock file);
+- schema-driven Operation Registry: one name/input/output/handler per
+  operation, with `schemas/` as the embedded contract source;
+- JSON/NDJSON streaming; token-friendly event model;
+- in-process periodic `Tick` housekeeping with in-flight-run protection;
+- `game-forge daemon status|stop|restart` + transparent CLI auto-start.
+
+`game-forge tick` remains as a manual one-shot housekeeping primitive.
 
 ## Prioritization rule
 

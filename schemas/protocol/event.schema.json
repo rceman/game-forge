@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://protocol/event",
+  "title": "game-forge-daemon/v1 NDJSON event",
+  "type": "object",
+  "required": ["ev"],
+  "properties": {
+    "id": { "type": "string" },
+    "ev": { "enum": ["start", "stage", "artifact", "done"] },
+    "run": { "type": "string" },
+    "name": { "type": "string" },
+    "status": { "enum": ["pass", "fail"] },
+    "ms": { "type": "integer", "minimum": 0 },
+    "data": {},
+    "kind": { "type": "string" },
+    "ref": { "type": "string" },
+    "path": { "type": "string" },
+    "code": { "enum": [0, 1] },
+    "err": {
+      "type": "object",
+      "required": ["code", "msg"],
+      "properties": {
+        "code": { "type": "string" },
+        "path": { "type": "string" },
+        "msg": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "ev": { "const": "stage" } }, "required": ["ev"] },
+      "then": { "required": ["name", "status"] }
+    },
+    {
+      "if": { "properties": { "ev": { "const": "artifact" } }, "required": ["ev"] },
+      "then": { "required": ["kind", "ref", "path"] }
+    },
+    {
+      "if": { "properties": { "ev": { "const": "done" } }, "required": ["ev"] },
+      "then": { "required": ["status", "code"] }
+    }
+  ]
+}

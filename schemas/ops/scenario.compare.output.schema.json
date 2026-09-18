@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/scenario.compare/output",
+  "type": "object",
+  "required": ["compared", "differing", "results"],
+  "properties": {
+    "compared": { "type": "integer" },
+    "differing": { "type": "integer" },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "match", "headless", "browser", "digest"],
+        "properties": {
+          "id": { "type": "string" },
+          "match": { "type": "boolean" },
+          "headless": { "type": "string" },
+          "browser": { "type": "string" },
+          "digest": { "type": "string" },
+          "explanation": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

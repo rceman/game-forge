@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/resource.list/output",
+  "type": "object",
+  "required": ["resources"],
+  "properties": {
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "provider", "state"],
+        "properties": {
+          "id": { "type": "string" },
+          "runId": { "type": "string" },
+          "project": { "type": "string" },
+          "kind": { "type": "string" },
+          "provider": { "type": "string" },
+          "namespace": { "type": "string" },
+          "pid": { "type": "integer" },
+          "host": { "type": "string" },
+          "state": { "enum": ["active", "expired"] },
+          "expires": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

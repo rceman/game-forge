@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/visual.sweep/input",
+  "type": "object",
+  "properties": {
+    "ticks": { "type": "integer", "minimum": 0 },
+    "unmuted": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

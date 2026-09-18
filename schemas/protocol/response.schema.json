@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://protocol/response",
+  "title": "game-forge-daemon/v1 response",
+  "type": "object",
+  "required": ["ok"],
+  "properties": {
+    "id": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "data": {},
+    "err": {
+      "type": "object",
+      "required": ["code", "msg"],
+      "properties": {
+        "code": { "type": "string" },
+        "path": { "type": "string" },
+        "msg": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -36,6 +36,9 @@ type Deps struct {
 	// a caller forwards a native tool's own filters through Game Forge
 	// instead of shelling out to it directly.
 	Extra []string
+	// OnStage, when set, is invoked after each stage completes so a streaming
+	// frontend can report progress while the profile is still running.
+	OnStage func(StageResult)
 }
 
 // StageResult is the outcome of one stage.
@@ -93,6 +96,9 @@ func (d Deps) runStages(ctx context.Context, sum *Summary, stages []project.Stag
 			res = StageResult{Name: stage.Name, OK: false, Detail: err.Error()}
 		}
 		sum.Stages = append(sum.Stages, res)
+		if d.OnStage != nil {
+			d.OnStage(res)
+		}
 	}
 	return nil
 }
@@ -118,6 +124,9 @@ func (d Deps) runNested(ctx context.Context, stage project.Stage, depth int) ([]
 		}
 		res.Name = stage.Name + "/" + res.Name
 		out = append(out, res)
+		if d.OnStage != nil {
+			d.OnStage(res)
+		}
 	}
 	return out, nil
 }

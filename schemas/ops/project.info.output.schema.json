@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/project.info/output",
+  "type": "object",
+  "required": ["root", "id", "type", "contract"],
+  "properties": {
+    "root": { "type": "string" },
+    "id": { "type": "string" },
+    "type": { "type": "string" },
+    "contract": { "type": "string" },
+    "capabilities": { "type": "array", "items": { "type": "string" } },
+    "adapters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "command", "protocol"],
+        "properties": {
+          "name": { "type": "string" },
+          "command": { "type": "array", "items": { "type": "string" } },
+          "protocol": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/profile.run/output",
+  "type": "object",
+  "required": ["profile", "ok", "stages"],
+  "properties": {
+    "profile": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "ms": { "type": "integer" },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "ok"],
+        "properties": {
+          "name": { "type": "string" },
+          "ok": { "type": "boolean" },
+          "ms": { "type": "integer" },
+          "detail": { "type": "string" },
+          "output": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

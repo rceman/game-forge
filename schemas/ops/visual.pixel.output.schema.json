@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/visual.pixel/output",
+  "type": "object",
+  "required": ["image", "width", "height", "samples"],
+  "properties": {
+    "image": { "type": "string" },
+    "width": { "type": "integer" },
+    "height": { "type": "integer" },
+    "samples": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["x", "y", "r", "g", "b", "a", "color"],
+        "properties": {
+          "x": { "type": "integer" },
+          "y": { "type": "integer" },
+          "r": { "type": "integer" },
+          "g": { "type": "integer" },
+          "b": { "type": "integer" },
+          "a": { "type": "integer" },
+          "color": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

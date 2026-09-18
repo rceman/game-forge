@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/doctor.run/output",
+  "type": "object",
+  "required": ["ok", "provider", "host", "details", "problems"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "configPath": { "type": "string" },
+    "configExists": { "type": "boolean" },
+    "namespace": { "type": "string" },
+    "provider": { "type": "string" },
+    "host": { "type": "string" },
+    "details": { "type": "array", "items": { "type": "string" } },
+    "problems": { "type": "array", "items": { "type": "string" } },
+    "leftRegistered": { "type": "boolean" },
+    "launchArgs": { "type": "string" }
+  },
+  "additionalProperties": false
+}

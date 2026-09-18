@@ -18,10 +18,10 @@ that implements the Game Forge contract.
 and configuration, build/test orchestration, deterministic scenario execution,
 headless and browser execution, screenshots and visual validation, browser
 diagnostics and lifecycle, production smoke, GPU verification, process/resource
-ownership and cleanup, scheduling, and future media/asset tooling.
+ownership and cleanup, a per-user control daemon, and future media/asset tooling.
 
 A game must never need to know about agent-browser, Chrome/CDP, Playwright,
-Windows interop, ffmpeg, GPU discovery, process cleanup, or scheduler internals.
+Windows interop, ffmpeg, GPU discovery, process cleanup, or daemon internals.
 Those live behind Game Forge providers.
 
 The architectural test: *if we create a second game tomorrow, how many Spin
@@ -33,9 +33,15 @@ The reusable harness is implemented and consumed by Spin Tower: project
 discovery and configuration, native test/build orchestration, deterministic
 scenario execution headless and in-browser, headless/browser comparison,
 screenshots and visual sweep, browser diagnostics, dev/prod server ownership,
-validation profiles, production smoke, GPU verification and benchmarking,
-owned-resource registry with lease/`gc`/`tick`, and a per-user scheduler. See
-[Roadmap](docs/ROADMAP.md) and the
+validation profiles, production smoke, GPU verification and benchmarking, an
+owned-resource registry, and a per-user control daemon that owns housekeeping.
+
+Every externally callable capability is a schema-defined **operation** behind a
+single Operation Registry. The CLI is a thin frontend that talks to a persistent
+per-user daemon (`game-forged`) over loopback HTTP; the daemon owns resource
+lifecycle and periodic housekeeping. See
+[Roadmap](docs/ROADMAP.md),
+[Daemon protocol](docs/DAEMON_PROTOCOL_V1.md), and the
 [Spin Tower migration matrix](docs/SPIN_TOWER_MIGRATION.md).
 
 ## Configuration
@@ -115,12 +121,17 @@ game-forge prod                # production build + smoke
 game-forge serve start|status|stop   # own the declared dev/prod server
 game-forge ps                  # list resources owned by Game Forge
 game-forge gc                  # reclaim expired owned resources
-game-forge tick                # idempotent scheduler entry point
-game-forge scheduler install|status|uninstall
+game-forge tick                # one idempotent housekeeping pass
+
+game-forge daemon status|stop|restart  # control the per-user daemon
 
 game-forge version
 game-forge help
 ```
+
+Most commands accept `--json` for a structured result and `--ndjson` for the
+raw event stream. Ordinary commands transparently start and reuse the daemon;
+you never need `daemon start` in normal use.
 
 Exit codes are stable: `0` success, `1` failure, `2` usage error.
 
@@ -160,7 +171,8 @@ Requires Go 1.24+.
 ## Documentation
 
 - [Vision](docs/VISION.md) — product direction and system boundary.
-- [Architecture](docs/ARCHITECTURE.md) — contract, providers, resource ownership, scheduler, first slice.
+- [Architecture](docs/ARCHITECTURE.md) — contract, providers, operation registry, daemon, resource ownership.
+- [Daemon protocol](docs/DAEMON_PROTOCOL_V1.md) — loopback HTTP, discovery, auth, operations, NDJSON streaming.
 - [Design Principles](docs/DESIGN_PRINCIPLES.md) — reusable-tooling and asset-pipeline principles.
 - [Roadmap](docs/ROADMAP.md) — incremental extraction plan driven by real consumers.
 - [Contract v1](docs/CONTRACT_V1.md) — the versioned project contract.

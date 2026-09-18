@@ -78,7 +78,7 @@ Every command the old `scripts/dev` exposed, and where it lives now.
 | GPU renderer probing | `internal/gpu` |
 | Validation-stage runner and reporting | `internal/profile` |
 | Scenario transport (JSONL) | `internal/adapter` |
-| Resource registry / lease / `gc` / `tick` / scheduler | `internal/process`, `internal/scheduler` |
+| Resource registry / lease / `gc` / `tick`, daemon + Operation Registry | `internal/process`, `internal/op`, `internal/core`, `internal/daemon`, `internal/client` |
 
 ## Game-specific logic intentionally retained in Spin Tower
 
@@ -99,7 +99,7 @@ Every command the old `scripts/dev` exposed, and where it lives now.
 `scripts/dev` is a compatibility wrapper: it maps the familiar command names
 onto `game-forge` and supplies the game-specific expressions. It contains no
 browser provider logic, no agent-browser invocation, no Chrome flags, no
-Windows/WSL interop, no daemon/TTL/watchdog management, no resource registry,
+Windows/WSL interop, no browser-daemon/TTL management, no resource registry,
 no server ownership, no screenshot orchestration, no GPU probing and no
 validation runner.
 

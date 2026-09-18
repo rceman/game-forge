@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/gpu.run/input",
+  "type": "object",
+  "properties": {
+    "scenario": { "type": "string" },
+    "ticks": { "type": "integer", "minimum": 0 },
+    "frames": { "type": "integer", "minimum": 1 },
+    "unmuted": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

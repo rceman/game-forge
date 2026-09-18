@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/browser.errors/input",
+  "type": "object",
+  "properties": {
+    "case": { "type": "string" },
+    "ticks": { "type": "integer", "minimum": 0 },
+    "unmuted": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

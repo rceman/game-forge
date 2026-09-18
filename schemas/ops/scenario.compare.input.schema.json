@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/scenario.compare/input",
+  "type": "object",
+  "properties": {
+    "ids": { "type": "array", "items": { "type": "string" } },
+    "all": { "type": "boolean" },
+    "seed": { "type": "string" },
+    "world": { "type": "string" },
+    "ticks": { "type": "integer", "minimum": 0 },
+    "params": { "type": "object" },
+    "unmuted": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

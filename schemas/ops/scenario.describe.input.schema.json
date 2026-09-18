@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/scenario.describe/input",
+  "type": "object",
+  "required": ["id"],
+  "properties": { "id": { "type": "string", "minLength": 1 } },
+  "additionalProperties": false
+}

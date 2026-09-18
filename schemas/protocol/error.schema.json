@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://protocol/error",
+  "title": "game-forge-daemon/v1 error",
+  "type": "object",
+  "required": ["code", "msg"],
+  "properties": {
+    "code": { "type": "string" },
+    "path": { "type": "string" },
+    "msg": { "type": "string" }
+  },
+  "additionalProperties": false
+}

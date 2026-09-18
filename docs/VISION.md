@@ -225,34 +225,41 @@ Normal completion cleans resources immediately.
 
 If an agent crashes or forgets cleanup, stale resources are recovered later through a lease/TTL model.
 
-## Scheduler, not cleanup daemon
+## Daemon, not OS scheduler
 
-A permanently running cleanup daemon is not required for v1.
+Game Forge owns a persistent per-user control daemon, `game-forged`, rather
+than relying on an OS scheduler (cron / systemd timer / Scheduled Task).
 
 The preferred model is:
 
 ```text
-OS scheduler
-    -> game-forge tick
-    -> inspect durable state
-    -> reap expired owned resources
+game-forge CLI
+    -> loopback HTTP (dynamic port, bearer auth)
+    -> game-forged
+    -> Operation Registry -> Core
+    -> periodic in-process Tick() reclaims expired owned resources
 ```
 
-User-facing commands can include:
+Ordinary commands transparently start and reuse the daemon; the daemon owns
+resource lifecycle and housekeeping. There is no cron entry, systemd timer,
+Windows Scheduled Task, or SYSTEM service.
+
+User-facing commands:
 
 ```text
 game-forge ps
 game-forge gc
 game-forge tick
 
-game-forge scheduler install
-game-forge scheduler status
-game-forge scheduler uninstall
+game-forge daemon status
+game-forge daemon stop
+game-forge daemon restart
 ```
 
-On Windows, a per-user Scheduled Task is preferred.
+`game-forge tick` remains as a manual one-shot housekeeping primitive; the
+daemon invokes the same Core Tick internally on a short cadence.
 
-Long-lived future services such as `game-forge mcp serve` are a separate concern and may have their own service lifecycle.
+See [DAEMON_PROTOCOL_V1.md](DAEMON_PROTOCOL_V1.md) for the wire contract.
 
 ## Asset philosophy
 

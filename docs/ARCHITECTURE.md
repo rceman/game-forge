@@ -47,7 +47,13 @@ internal/
   scenario/
   browser/
   process/
-  scheduler/
+  op/          # Operation Registry: names + schemas + handlers
+  core/        # the operation implementations
+  daemon/      # loopback HTTP transport, discovery, housekeeping
+  client/      # in-process daemon client used by the CLI
+schemas/
+  protocol/    # request/response/event/error envelopes
+  ops/         # per-operation input/output JSON Schemas
 docs/
 examples/minimal-web-game/
 ```
@@ -432,51 +438,50 @@ game-forge tick
 
 `gc` performs explicit stale cleanup.
 
-`tick` is the idempotent scheduler entrypoint.
+`tick` performs one idempotent housekeeping pass.
 
-## 17. Scheduler
+## 17. Daemon
 
-No permanently running cleanup daemon is needed for v1.
+Game Forge now owns a persistent per-user control daemon, `game-forged`. It
+replaces the earlier cron/OS-scheduler housekeeping model entirely: there is no
+cron entry, systemd timer, Windows Scheduled Task, or SYSTEM service.
 
-Desired interface:
+Transport is one cross-platform mechanism — HTTP over loopback TCP on a dynamic
+OS-assigned port (`net.Listen("tcp", "127.0.0.1:0")`). There are no
+Unix-socket / named-pipe variants and no public listener.
 
-```text
-game-forge scheduler install
-game-forge scheduler status
-game-forge scheduler uninstall
-```
-
-The OS scheduler periodically invokes:
+Ordinary commands transparently start and reuse the daemon:
 
 ```text
-game-forge tick
+read ~/.game-forge/run/daemon.json
+-> authenticated GET /health
+-> healthy: use it
+-> absent/stale: start game-forge daemon serve, wait, re-check
 ```
 
-Windows direction:
+Discovery state is ephemeral and written atomically; it carries a 256-bit
+bearer token that authorizes every request. The token is never logged or
+printed.
 
-- per-user Scheduled Task;
-- no SYSTEM service requirement.
+The daemon owns periodic housekeeping: an in-process loop calls the same Core
+`Tick` that `game-forge tick` exposes, reclaiming expired owned resources while
+skipping resources whose run is in-flight. It never shells out to the binary.
 
-Linux direction:
+Daemon lifecycle commands:
 
-- per-user systemd timer where available;
-- cron-compatible fallback may be considered if needed.
+```text
+game-forge daemon status
+game-forge daemon stop
+game-forge daemon restart
+```
 
-A one-minute cadence is adequate for early cleanup use cases.
+See `DAEMON_PROTOCOL_V1.md` for the wire contract.
 
 ## 18. Long-lived services
 
-Future long-running capabilities such as:
-
-```text
-game-forge mcp serve
-```
-
-are not the same as scheduler cleanup.
-
-They may use a proper service lifecycle later.
-
-Do not introduce a generic permanent daemon merely because future MCP may require a server.
+A future MCP frontend is a thin adapter over the same Operation Registry — it
+enumerates operation metadata and calls the Core handlers directly, exactly as
+the daemon's HTTP transport does. It must never shell out to the CLI.
 
 ## 19. Asset pipeline architecture
 

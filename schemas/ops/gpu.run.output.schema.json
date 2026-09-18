@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/gpu.run/output",
+  "type": "object",
+  "required": ["ok", "software", "scenario", "renderer"],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "software": { "type": "boolean" },
+    "scenario": { "type": "string" },
+    "ticks": { "type": "integer" },
+    "renderer": {
+      "type": "object",
+      "properties": {
+        "vendor": { "type": "string" },
+        "unmaskedVendor": { "type": "string" },
+        "renderer": { "type": "string" },
+        "unmaskedRenderer": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "benchmark": {
+      "type": "object",
+      "required": ["frames", "meanFrameMs"],
+      "properties": {
+        "frames": { "type": "integer" },
+        "meanFrameMs": { "type": "number" },
+        "drawCalls": { "type": "integer" },
+        "triangles": { "type": "integer" },
+        "textures": { "type": "integer" },
+        "enemies": { "type": "integer" },
+        "projectiles": { "type": "integer" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

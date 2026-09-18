@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/server.stop/output",
+  "type": "object",
+  "required": ["server", "state", "url", "owned"],
+  "properties": {
+    "server": { "type": "string" },
+    "state": { "type": "string" },
+    "url": { "type": "string" },
+    "owned": { "type": "boolean" },
+    "id": { "type": "string" },
+    "pid": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/profile.run/input",
+  "type": "object",
+  "required": ["profile"],
+  "properties": {
+    "profile": { "type": "string", "minLength": 1 },
+    "verbose": { "type": "boolean" },
+    "unmuted": { "type": "boolean" },
+    "extra": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

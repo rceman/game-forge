@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/browser.eval/input",
+  "type": "object",
+  "properties": {
+    "expr": { "type": "string" },
+    "case": { "type": "string" },
+    "ticks": { "type": "integer", "minimum": 0 },
+    "seed": { "type": "string" },
+    "world": { "type": "string" },
+    "click": { "type": "string" },
+    "press": { "type": "string" },
+    "reload": { "type": "boolean" },
+    "unmuted": { "type": "boolean" },
+    "leaseMs": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

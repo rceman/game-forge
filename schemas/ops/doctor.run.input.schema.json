@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/doctor.run/input",
+  "type": "object",
+  "properties": {
+    "noCleanup": { "type": "boolean" },
+    "leaseMs": { "type": "integer", "minimum": 0 },
+    "timeoutMs": { "type": "integer", "minimum": 0 },
+    "unmuted": { "type": "boolean" }
+  },
+  "additionalProperties": false
+}

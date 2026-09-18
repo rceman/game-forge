@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://protocol/request",
+  "title": "game-forge-daemon/v1 request",
+  "type": "object",
+  "required": ["v", "op"],
+  "properties": {
+    "v": { "type": "integer" },
+    "id": { "type": "string" },
+    "op": { "type": "string", "minLength": 1 },
+    "cwd": { "type": "string" },
+    "args": { "type": "object" }
+  },
+  "additionalProperties": false
+}

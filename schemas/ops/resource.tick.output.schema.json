@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/resource.tick/output",
+  "type": "object",
+  "required": ["reclaimed", "failed"],
+  "properties": {
+    "reclaimed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "provider"],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "type": "string" },
+          "provider": { "type": "string" },
+          "namespace": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "failed": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/visual.sweep/output",
+  "type": "object",
+  "required": ["failed", "cases"],
+  "properties": {
+    "failed": { "type": "integer" },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case", "kind", "ok"],
+        "properties": {
+          "case": { "type": "string" },
+          "kind": { "type": "string" },
+          "ok": { "type": "boolean" },
+          "error": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/scenario.describe/output",
+  "type": "object",
+  "required": ["id", "description"],
+  "properties": {
+    "id": { "type": "string" },
+    "description": {},
+    "params": {}
+  },
+  "additionalProperties": false
+}

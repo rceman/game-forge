@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/server.start/output",
+  "type": "object",
+  "required": ["server", "state", "url"],
+  "properties": {
+    "server": { "type": "string" },
+    "state": { "enum": ["started", "reused"] },
+    "url": { "type": "string" },
+    "pid": { "type": "integer" },
+    "log": { "type": "string" },
+    "leaseMs": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "game-forge://ops/scenario.run/output",
+  "type": "object",
+  "required": ["scenario", "passed", "status", "digest", "checks"],
+  "properties": {
+    "scenario": { "type": "string" },
+    "passed": { "type": "boolean" },
+    "status": { "type": "string" },
+    "digest": { "type": "string" },
+    "simSeed": { "type": "integer" },
+    "worldSeed": { "type": "integer" },
+    "ticks": { "type": "integer" },
+    "browser": { "type": "boolean" },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "ok"],
+        "properties": {
+          "name": { "type": "string" },
+          "ok": { "type": "boolean" },
+          "detail": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
