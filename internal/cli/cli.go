@@ -42,6 +42,8 @@ func Run(args []string) int {
 		return ExitOK
 	case "daemon":
 		return cmdDaemon(args[1:])
+	case "mcp":
+		return cmdMCP(args[1:])
 	}
 	c, code, done := dispatch(args)
 	if done {
@@ -183,6 +185,9 @@ Daemon:
   daemon status                Show the running daemon
   daemon stop                  Stop the daemon gracefully
   daemon restart               Restart the daemon
+
+MCP:
+  mcp serve [--cwd DIR]        Serve MCP over stdio (for MCP-capable agents)
 
 Other:
   version                      Print the Game Forge version

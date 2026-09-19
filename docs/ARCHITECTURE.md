@@ -22,16 +22,32 @@ Status: architectural direction for the first implementation. This document is i
                           Game
 ```
 
-Game Forge Core should be reusable from multiple frontends:
+Game Forge Core is reusable from multiple frontends, all over the same
+Operation Registry:
 
 ```text
-CLI ---------\
-MCP ----------> Core
-CI ----------/
-scheduler ---/
+                 game-forged
+                     |
+              Operation Registry
+                     |
+                    Core
+
+  CLI --------------^
+  MCP stdio --------^
+  future UI/CI -----^
 ```
 
-The CLI is the first frontend.
+Frontends never touch Core directly — they go through the per-user daemon,
+which owns lifecycle and resource ownership:
+
+```text
+CLI        -> daemon HTTP client -> game-forged -> registry -> Core
+MCP stdio  -> daemon client      -> game-forged -> registry -> Core
+```
+
+The CLI is the first frontend; the MCP stdio server is the second. Both share
+operation semantics and schemas; the daemon remains the single owner of
+browsers, servers, leases and housekeeping.
 
 ## 2. Repository shape
 
@@ -50,7 +66,8 @@ internal/
   op/          # Operation Registry: names + schemas + handlers
   core/        # the operation implementations
   daemon/      # loopback HTTP transport, discovery, housekeeping
-  client/      # in-process daemon client used by the CLI
+  client/      # in-process daemon client used by the CLI and MCP frontend
+  mcpfrontend/ # the stdio MCP frontend over the same operation model
 schemas/
   protocol/    # request/response/event/error envelopes
   ops/         # per-operation input/output JSON Schemas
@@ -477,11 +494,47 @@ game-forge daemon restart
 
 See `DAEMON_PROTOCOL_V1.md` for the wire contract.
 
-## 18. Long-lived services
+## 18. MCP frontend
 
-A future MCP frontend is a thin adapter over the same Operation Registry — it
-enumerates operation metadata and calls the Core handlers directly, exactly as
-the daemon's HTTP transport does. It must never shell out to the CLI.
+`game-forge mcp serve` exposes Game Forge over MCP stdio — the canonical first
+transport for local MCP-capable agents. It is a thin frontend only:
+
+```text
+MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
+   -> Operation Registry -> Core
+```
+
+- It reuses the same `internal/client` daemon client as the CLI, so a missing
+  daemon is auto-started and a stale discovery recovered exactly as for any
+  other command. The MCP process never creates a second resource-owning
+  Runtime: browsers, dev servers, leases and `ps`/`gc`/`tick` stay owned by the
+  per-user daemon.
+- On startup it verifies daemon protocol compatibility (a mismatched daemon
+  fails clearly — `game-forge daemon restart`), then discovers the catalog via
+  `GET /v1/capabilities` + `GET /v1/schema/<op>`. Tool names, descriptions and
+  input/output JSON Schemas come verbatim from the Operation Registry, so the
+  tools always describe the contract the daemon actually validates and
+  executes.
+- Operation `scenario.run` becomes tool `scenario_run` — dots map to
+  underscores deterministically and collisions are rejected at startup. There
+  is no per-tool protocol boilerplate; the server is already Game Forge.
+- Each tool call becomes a `{v, id, op, cwd, args}` envelope sent over the
+  daemon client's stream transport. The project cwd is the MCP process's own
+  cwd, or `--cwd <dir>`; it lives in the envelope, never inside `args`. Two
+  `mcp serve` instances with different cwd stay project-isolated through the
+  daemon's project-keyed resource model.
+- Results map to `structuredContent` (the canonical operation result, compact
+  JSON as the text fallback); failures become `isError` results carrying the
+  canonical `code`/`path`/`msg`. Semantic stage/artifact events become MCP
+  progress notifications when the client supplied a progress token; MCP
+  cancellation propagates to the daemon request and cancels the Core operation
+  without harming reusable owned resources.
+- Artifacts stay referenced (`kind`, `ref`, `path`), never inlined.
+
+Out of scope for now: MCP resources/prompts, remote/HTTP MCP, OAuth, public
+listeners. A future resource layer can expose artifacts more richly over the
+same registry.
+
 
 ## 19. Asset pipeline architecture
 

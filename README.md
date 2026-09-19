@@ -37,9 +37,9 @@ validation profiles, production smoke, GPU verification and benchmarking, an
 owned-resource registry, and a per-user control daemon that owns housekeeping.
 
 Every externally callable capability is a schema-defined **operation** behind a
-single Operation Registry. The CLI is a thin frontend that talks to a persistent
-per-user daemon (`game-forged`) over loopback HTTP; the daemon owns resource
-lifecycle and periodic housekeeping. See
+single Operation Registry. The CLI and the MCP stdio server are thin frontends
+that talk to a persistent per-user daemon (`game-forged`) over loopback HTTP;
+the daemon owns resource lifecycle and periodic housekeeping. See
 [Roadmap](docs/ROADMAP.md),
 [Daemon protocol](docs/DAEMON_PROTOCOL_V1.md), and the
 [Spin Tower migration matrix](docs/SPIN_TOWER_MIGRATION.md).
@@ -124,6 +124,7 @@ game-forge gc                  # reclaim expired owned resources
 game-forge tick                # one idempotent housekeeping pass
 
 game-forge daemon status|stop|restart  # control the per-user daemon
+game-forge mcp serve [--cwd DIR]         # expose Game Forge over MCP stdio
 
 game-forge version
 game-forge help

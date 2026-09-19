@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/rceman/game-forge/internal/daemon"
@@ -27,6 +28,24 @@ type Client struct {
 	// streamHC has no timeout: a streamed operation manages its own deadline,
 	// and a fixed client timeout would cut a long run short.
 	streamHC *http.Client
+	// cwd is the caller's project context, sent in every request envelope so
+	// the daemon discovers the right project. Defaults to the process cwd; a
+	// frontend (the MCP server) may pin it via WithCwd.
+	cwd string
+}
+
+// NewClient returns a client for a known daemon. It is used by tests and by
+// frontends that already hold discovery state; Connect/Ensure are the normal
+// entry points.
+func NewClient(d *daemon.Discovery, cwd string) *Client {
+	return &Client{d: d, hc: &http.Client{Timeout: 30 * time.Second}, streamHC: &http.Client{}, cwd: cwd}
+}
+
+// WithCwd returns a client identical to c but pinning the request cwd.
+func (c *Client) WithCwd(cwd string) *Client {
+	n := *c
+	n.cwd = cwd
+	return &n
 }
 
 // Endpoint returns the daemon base URL.
@@ -41,11 +60,17 @@ func Connect(ctx context.Context) *Client {
 	if err != nil || d == nil {
 		return nil
 	}
-	c := &Client{d: d, hc: &http.Client{Timeout: 30 * time.Second}, streamHC: &http.Client{}}
+	c := NewClient(d, mustGetwd())
 	if !c.healthy(ctx) {
 		return nil
 	}
 	return c
+}
+
+// mustGetwd returns the process cwd, or "" when it cannot be determined.
+func mustGetwd() string {
+	wd, _ := os.Getwd()
+	return wd
 }
 
 // healthy reports whether the daemon answers an authenticated health check.
@@ -71,7 +96,7 @@ func (c *Client) healthy(ctx context.Context) bool {
 
 // Run executes one operation and returns its data or the structured error.
 func (c *Client) Run(ctx context.Context, opName string, args any) (json.RawMessage, *op.Error) {
-	reqBody, err := marshalRequest("", opName, args)
+	reqBody, err := c.marshalRequest("", opName, args)
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeInternal, Msg: err.Error()}
 	}
@@ -100,7 +125,7 @@ func (c *Client) Run(ctx context.Context, opName string, args any) (json.RawMess
 // Stream executes one operation, invoking onEvent for each NDJSON event, and
 // returns the final event's data.
 func (c *Client) Stream(ctx context.Context, opName string, args any, onEvent func(op.Event)) (json.RawMessage, *op.Error) {
-	reqBody, err := marshalRequest("", opName, args)
+	reqBody, err := c.marshalRequest("", opName, args)
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeInternal, Msg: err.Error()}
 	}
@@ -116,6 +141,19 @@ func (c *Client) Stream(ctx context.Context, opName string, args any, onEvent fu
 		return nil, &op.Error{Code: op.CodeFailed, Msg: "daemon request: " + err.Error()}
 	}
 	defer resp.Body.Close()
+	// A rejected request (bad args, unknown op, wrong version) answers with a
+	// plain JSON response envelope, not an NDJSON stream — return its error.
+	if !strings.Contains(resp.Header.Get("Content-Type"), "application/x-ndjson") {
+		var reply op.Response
+		if derr := json.NewDecoder(resp.Body).Decode(&reply); derr != nil {
+			return nil, &op.Error{Code: op.CodeInternal, Msg: "decode reply: " + derr.Error()}
+		}
+		if reply.Err != nil {
+			return nil, reply.Err
+		}
+		raw, _ := json.Marshal(reply.Data)
+		return raw, nil
+	}
 	dec := json.NewDecoder(resp.Body)
 	var last *op.Event
 	for {
@@ -180,13 +218,73 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// marshalRequest builds a request envelope body.
-func marshalRequest(id, opName string, args any) ([]byte, error) {
-	cwd, err := os.Getwd()
+// OpSchema is the canonical contract document for one operation, as served by
+// GET /v1/schema/<op>. The MCP frontend builds tools directly from these so
+// the exposed schemas are exactly what the daemon validates and executes.
+type OpSchema struct {
+	Op      string          `json:"op"`
+	Summary string          `json:"summary"`
+	Stream  bool            `json:"stream"`
+	Input   json.RawMessage `json:"input"`
+	Output  json.RawMessage `json:"output"`
+}
+
+// Schema returns the canonical input/output contract for one operation.
+func (c *Client) Schema(ctx context.Context, opName string) (*OpSchema, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.d.Endpoint+"/v1/schema/"+opName, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Authorization", "Bearer "+c.d.Token)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var v OpSchema
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// Health is the daemon's liveness/compatibility payload.
+type Health struct {
+	OK       bool   `json:"ok"`
+	V        int    `json:"v"`
+	Protocol string `json:"protocol"`
+	PID      int    `json:"pid"`
+}
+
+// HealthCheck returns the daemon health document so a frontend can verify the
+// connected daemon speaks the protocol this binary was built against.
+func (c *Client) HealthCheck(ctx context.Context) (*Health, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.d.Endpoint+"/health", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.d.Token)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var h Health
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
+// marshalRequest builds a request envelope body, forwarding the client's
+// pinned cwd so the daemon resolves the caller's project.
+func (c *Client) marshalRequest(id, opName string, args any) ([]byte, error) {
+	cwd := c.cwd
+	if cwd == "" {
+		cwd = mustGetwd()
+	}
 	var rawArgs json.RawMessage
+	var err error
 	if args != nil {
 		rawArgs, err = json.Marshal(args)
 		if err != nil {

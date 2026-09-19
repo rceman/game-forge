@@ -46,10 +46,12 @@ func NewServer(rt *core.Runtime, reg *op.Registry, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	tok, _ := newToken()
 	return &Server{
 		rt:          rt,
 		reg:         reg,
 		logger:      logger,
+		token:       tok,
 		done:        make(chan struct{}),
 		stopCh:      make(chan struct{}),
 		incarnation: newIncarnation(),
@@ -120,11 +122,14 @@ func (s *Server) Serve() error {
 		return err
 	}
 	defer release()
-	tok, err := newToken()
-	if err != nil {
-		return err
+	if s.token == "" {
+		tok, err := newToken()
+		if err != nil {
+			return err
+		}
+		s.token = tok
 	}
-	s.token = tok
+	tok := s.token
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("bind daemon: %w", err)
@@ -260,6 +265,14 @@ func (s *Server) housekeeping() {
 		}
 	}
 }
+
+// Token returns the bearer token for this incarnation. It is used by tests
+// serving the handler directly.
+func (s *Server) Token() string { return s.token }
+
+// Handler returns the daemon's authenticated HTTP handler. It is exported so
+// tests and frontends can serve the same routes without binding a listener.
+func (s *Server) Handler() http.Handler { return s.routes() }
 
 // routes returns the authenticated HTTP mux.
 func (s *Server) routes() http.Handler {
