@@ -28,13 +28,18 @@ Operation Registry:
 ```text
                  game-forged
                      |
-              Operation Registry
+     +---------------+---------------+
+     |                               |
+  Project Registry             Operation Registry
+     |                               |
+     +---------------+---------------+
                      |
                     Core
 
-  CLI --------------^
-  MCP stdio --------^
-  future UI/CI -----^
+  CLI ----------------^
+  MCP HTTP (/mcp) ----^
+  MCP stdio ----------^
+  future UI/CI -------^
 ```
 
 Frontends never touch Core directly — they go through the per-user daemon,
@@ -42,12 +47,28 @@ which owns lifecycle and resource ownership:
 
 ```text
 CLI        -> daemon HTTP client -> game-forged -> registry -> Core
+MCP /mcp   -> in-process         -> game-forged -> registry -> Core
 MCP stdio  -> daemon client      -> game-forged -> registry -> Core
 ```
 
-The CLI is the first frontend; the MCP stdio server is the second. Both share
-operation semantics and schemas; the daemon remains the single owner of
-browsers, servers, leases and housekeeping.
+The CLI is the first frontend; the canonical MCP endpoint is the daemon's own
+`/mcp` streamable-HTTP route, served by an in-process frontend sharing the
+daemon's dispatcher — MCP calls execute the identical `prepare`+`exec`
+pipeline as `/v1/run` with no HTTP loop into the daemon. `mcp serve` remains
+as a stdio compatibility frontend over the daemon client. All share operation
+semantics and schemas; the daemon remains the single owner of browsers,
+servers, leases and housekeeping.
+
+### Project selection
+
+Every MCP call carries an explicit `project_code` — there are no project
+sessions, no `session_start`/`session_use`, no hidden current-project state,
+and no per-project daemon or MCP endpoint. Codes map to projects through the
+durable machine-local registry (`~/.game-forge/state/projects.json`,
+`game-forge project add|list|show|remove`). The daemon resolves the code to a
+canonical root per request, so registry changes are visible immediately and
+concurrent calls for different projects never share mutable selection state.
+See `DAEMON_PROTOCOL_V1.md`.
 
 ## 2. Repository shape
 
@@ -463,8 +484,12 @@ Game Forge now owns a persistent per-user control daemon, `game-forged`. It
 replaces the earlier cron/OS-scheduler housekeeping model entirely: there is no
 cron entry, systemd timer, Windows Scheduled Task, or SYSTEM service.
 
-Transport is one cross-platform mechanism — HTTP over loopback TCP on a dynamic
-OS-assigned port (`net.Listen("tcp", "127.0.0.1:0")`). There are no
+Transport is one cross-platform mechanism — HTTP over loopback TCP. The daemon
+binds **one durable port** in `50000-59999`: first start picks a free port,
+persists it in `~/.game-forge/state/endpoint.json`, and every later
+incarnation rebinds exactly it — so MCP client configuration is stable across
+restarts. An occupied persisted port fails startup loudly; `game-forge daemon
+rebind` is the deliberate recovery (it never silently moves). There are no
 Unix-socket / named-pipe variants and no public listener.
 
 Ordinary commands transparently start and reuse the daemon:
@@ -490,41 +515,42 @@ Daemon lifecycle commands:
 game-forge daemon status
 game-forge daemon stop
 game-forge daemon restart
+game-forge daemon rebind   # choose a new durable port (MCP endpoint changes)
 ```
 
 See `DAEMON_PROTOCOL_V1.md` for the wire contract.
 
 ## 18. MCP frontend
 
-`game-forge mcp serve` exposes Game Forge over MCP stdio — the canonical first
-transport for local MCP-capable agents. It is a thin frontend only:
+The canonical MCP transport is the daemon's own streamable-HTTP endpoint —
+`http://127.0.0.1:<stable-port>/mcp` — so agents configure one URL once. It is
+a thin frontend over the daemon's in-process dispatcher:
 
 ```text
-MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
-   -> Operation Registry -> Core
+MCP client --HTTP--> game-forged /mcp --in-process dispatch--> Operation Registry -> Core
+MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged -> same pipeline
 ```
 
-- It reuses the same `internal/client` daemon client as the CLI, so a missing
-  daemon is auto-started and a stale discovery recovered exactly as for any
-  other command. The MCP process never creates a second resource-owning
-  Runtime: browsers, dev servers, leases and `ps`/`gc`/`tick` stay owned by the
-  per-user daemon.
-- On startup it verifies daemon protocol compatibility and discovers the
-  whole catalog in ONE request — `GET /v1/catalog` carries `{v, protocol,
-  ops:[{op, summary, stream, input, output}]}`. Initialization cost never
-  grows with tool count (a 100-tool Game Forge still takes one catalog
-  request); a catalog-less or protocol-mismatched daemon fails clearly
-  (`game-forge daemon restart`). Tool names, descriptions and schemas derive
-  from the Operation Registry, so the tools always describe the contract the
-  daemon actually validates and executes.
+- `/mcp` is mounted inside the daemon's one listener. The frontend calls the
+  daemon's dispatcher **in process** — no HTTP loop into `/v1/run` — but runs
+  the identical `prepare`+`exec` pipeline: same project resolution, argument
+  and output validation, run ids, cancellation and progress.
+- `/mcp` authenticates with the **durable MCP credential**
+  (`~/.game-forge/state/mcp.token`, 0600) — separate from the ephemeral
+  per-incarnation control-API token, so client configuration survives
+  restarts. Non-local `Origin` headers are rejected (DNS-rebinding guard).
+  `game-forge mcp info [--show-token]` reports the endpoint and, only when
+  asked, the credential.
+- Tool names, descriptions and schemas derive from the Operation Registry
+  catalog — one fetch at frontend construction, never per-operation requests.
+- **Project selection is explicit per call**: every tool's input schema gains
+  a required `project_code` property, injected at the transport layer and
+  stripped before canonical validation. The daemon resolves it through the
+  project registry; `unknown_project`, `project_unavailable` and
+  `project_changed` are structured results. There is no session, no
+  current-project state, and no per-project MCP process or endpoint.
 - Operation `scenario.run` becomes tool `scenario_run` — dots map to
-  underscores deterministically and collisions are rejected at startup. There
-  is no per-tool protocol boilerplate; the server is already Game Forge.
-- Each tool call becomes a `{v, id, op, cwd, args}` envelope sent over the
-  daemon client's stream transport. The project cwd is the MCP process's own
-  cwd, or `--cwd <dir>`; it lives in the envelope, never inside `args`. Two
-  `mcp serve` instances with different cwd stay project-isolated through the
-  daemon's project-keyed resource model.
+  underscores deterministically and collisions are rejected at startup.
 - Results map to `structuredContent` (the authoritative canonical operation
   result); failures become `isError` results carrying the
   canonical `code`/`path`/`msg`. Semantic stage/artifact events become MCP
@@ -532,14 +558,19 @@ MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
   cancellation propagates to the daemon request and cancels the Core operation
   without harming reusable owned resources.
 - Artifacts stay referenced (`kind`, `ref`, `path`), never inlined.
+- `game-forge mcp serve` remains as the stdio compatibility frontend — same
+  dispatcher contract (over the daemon HTTP client), same `project_code`
+  routing, for MCP clients that cannot speak streamable HTTP.
 
 ### MCP efficiency contract
 
 The interface is consumed by coding agents, so wire efficiency is part of
 correctness — the same discipline as "no second Runtime":
 
-- **Initialization**: one `/v1/catalog` request (protocol identity included),
-  not one schema request per operation.
+- **Initialization**: one catalog fetch (in-process on `/mcp`, one
+  `/v1/catalog` request over stdio) — never one schema request per operation.
+- **project_code overhead is measured**: the injected transport property costs
+  ~58 B/tool; the audit reports its serialized cost as `projectCodeBytes`.
 - **Model surface**: `tools/list` carries name + description + input schema.
   Output schemas are omitted by default — the daemon still validates every
   result canonically, and a model needs input shape, not result shape, to
@@ -563,9 +594,9 @@ correctness — the same discipline as "no second Runtime":
   file is never auto-rebaselined — a raised limit needs a justification in
   the commit.
 
-Out of scope for now: MCP resources/prompts, remote/HTTP MCP, OAuth, public
-listeners. A future resource layer can expose artifacts more richly over the
-same registry.
+Out of scope for now: MCP resources/prompts, remote (non-loopback) MCP, OAuth,
+public listeners. A future resource layer can expose artifacts more richly
+over the same registry.
 
 
 ## 19. Asset pipeline architecture

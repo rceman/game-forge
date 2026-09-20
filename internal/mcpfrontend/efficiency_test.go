@@ -1,61 +1,71 @@
 package mcpfrontend
 
 // Efficiency-contract tests: the MCP wire surface is gated on serialized
-// bytes, round trips and latency — not on source inspection. The catalog
+// bytes, dispatch calls and latency — not on source inspection. The catalog
 // gates run against the REAL operation registry (canonical names, summaries
 // and schemas); the call-level gates run through the official MCP SDK client
-// against a real daemon HTTP handler over stub operations.
+// against the daemon's in-process dispatcher — the same path /mcp serves.
+//
+// project_code is required on every call; tests register temp projects so the
+// daemon resolves real registry entries.
 
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/rceman/game-forge/internal/client"
 	"github.com/rceman/game-forge/internal/core"
 	"github.com/rceman/game-forge/internal/daemon"
 	"github.com/rceman/game-forge/internal/op"
 	"github.com/rceman/game-forge/schemas"
 )
 
-// realDaemon serves the real operation registry (canonical schemas) behind a
-// daemon HTTP handler. Handlers are the genuine Core implementations; catalog
-// tests never invoke them. paths records the daemon endpoints that were hit.
-func realDaemon(t *testing.T) (*client.Client, func() []string) {
+// countingDisp wraps a dispatcher and counts how it is used, so init/discovery
+// gates can prove the frontend does O(1) catalog fetches and zero runs.
+type countingDisp struct {
+	d        Dispatcher
+	catalogs atomic.Int64
+	runs     atomic.Int64
+}
+
+func (c *countingDisp) Catalog(ctx context.Context) (string, int, []op.Meta, error) {
+	c.catalogs.Add(1)
+	return c.d.Catalog(ctx)
+}
+
+func (c *countingDisp) Run(ctx context.Context, req *op.Request, sink op.Sink) (any, *op.Error) {
+	c.runs.Add(1)
+	return c.d.Run(ctx, req, sink)
+}
+
+func (c *countingDisp) Requests() int64 { return c.d.Requests() }
+
+// realDaemon serves the real operation registry (canonical schemas) through
+// the daemon's in-process dispatcher — identical to what /mcp mounts.
+// Handlers are the genuine Core implementations; catalog tests never invoke
+// them.
+func realDaemon(t *testing.T) (*daemon.Server, *countingDisp) {
 	t.Helper()
 	t.Setenv("GAME_FORGE_HOME", t.TempDir())
 	reg := op.NewRegistry()
 	if err := core.Register(reg, core.NewRuntime(false)); err != nil {
 		t.Fatal(err)
 	}
-	var mu sync.Mutex
-	var paths []string
 	ds := daemon.NewServer(core.NewRuntime(false), reg, nil)
-	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		paths = append(paths, r.URL.Path)
-		mu.Unlock()
-		ds.Handler().ServeHTTP(w, r)
-	}))
-	t.Cleanup(httpSrv.Close)
-	cl := client.NewClient(&daemon.Discovery{
-		Protocol: daemon.Protocol, Endpoint: httpSrv.URL, PID: 1, Token: ds.Token(),
-	}, t.TempDir())
-	return cl, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string{}, paths...) }
+	return ds, &countingDisp{d: ds}
 }
 
 // mcpClientOpt is mcpClient with explicit frontend options.
-func mcpClientOpt(t *testing.T, cl *client.Client, cwd string, opt Options) *mcp.ClientSession {
+func mcpClientOpt(t *testing.T, disp Dispatcher, opt Options) *mcp.ClientSession {
 	t.Helper()
-	fe, err := NewWithOptions(context.Background(), cl, cwd, opt)
+	fe, err := New(context.Background(), disp, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +94,8 @@ func serialized(t *testing.T, v any) int {
 // ---- catalog surface --------------------------------------------------------
 
 func TestEfficiencyCatalogBudgets(t *testing.T) {
-	cl, _ := realDaemon(t)
-	cs := mcpClient(t, cl, "/proj")
+	_, disp := realDaemon(t)
+	cs := mcpClientOpt(t, disp, Options{})
 	b, err := LoadBudget()
 	if err != nil {
 		t.Fatal(err)
@@ -126,53 +136,60 @@ func TestEfficiencyCatalogBudgets(t *testing.T) {
 			t.Errorf("tool %s exposes outputSchema in compact mode", tool.Name)
 		}
 	}
+	// Every tool carries the required transport-level project_code.
+	for _, tool := range tl.Tools {
+		ib, _ := json.Marshal(tool.InputSchema)
+		if !strings.Contains(string(ib), `"project_code"`) {
+			t.Errorf("tool %s input schema lacks project_code", tool.Name)
+		}
+	}
 	t.Logf("catalog=%dB surface=%dB tools=%d largest=%s %dB", catalog, surface, len(tl.Tools), maxName, maxTool)
 }
 
 // ---- initialization ---------------------------------------------------------
 
 func TestEfficiencyInitRequests(t *testing.T) {
-	cl, paths := realDaemon(t)
-	// Frontend init must be O(1) daemon requests — not one per operation.
-	before := cl.Requests()
-	fe, err := New(context.Background(), cl, "/proj")
+	_, disp := realDaemon(t)
+	// Frontend init must be O(1): exactly one catalog fetch regardless of how
+	// many operations exist, and zero operation runs.
+	fe, err := New(context.Background(), disp, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = fe
-	got := int(cl.Requests() - before)
-	if got > 2 {
-		t.Fatalf("init made %d daemon requests (want <= 2)", got)
+	if disp.catalogs.Load() != 1 {
+		t.Fatalf("init fetched the catalog %d times (want 1)", disp.catalogs.Load())
 	}
-	for _, p := range paths() {
-		if strings.HasPrefix(p, "/v1/schema/") {
-			t.Fatalf("init hit per-operation schema endpoint %s — catalog should cover it", p)
-		}
+	if disp.runs.Load() != 0 {
+		t.Fatalf("init ran %d operations (want 0)", disp.runs.Load())
+	}
+	if n := disp.Requests(); n > 2 {
+		t.Fatalf("init made %d daemon HTTP requests (want <= 2)", n)
 	}
 }
 
 func TestEfficiencyDiscoveryIsMetadataOnly(t *testing.T) {
-	cl, paths := realDaemon(t)
-	cs := mcpClient(t, cl, "/proj")
+	_, disp := realDaemon(t)
+	cs := mcpClientOpt(t, disp, Options{})
 	if _, err := cs.ListTools(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	// Init + tools/list may only touch metadata endpoints — never /v1/run,
-	// which is the only path that can start a browser, server or GPU probe.
-	for _, p := range paths() {
-		if p == "/v1/run" {
-			t.Fatal("discovery invoked an operation — it must be metadata-only")
-		}
+	// Init + tools/list may only touch the catalog — never dispatch an
+	// operation, which is the only path that can start a browser, server or
+	// GPU probe.
+	if disp.runs.Load() != 0 {
+		t.Fatalf("discovery invoked %d operations — it must be metadata-only", disp.runs.Load())
 	}
 }
 
 // ---- call results -----------------------------------------------------------
 
 func TestEfficiencyCompactResultNoDuplication(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj")
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "test_echo", Arguments: map[string]any{"a": 1}})
+		Name: "test_echo", Arguments: map[string]any{"project_code": "TEST", "a": 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,10 +219,11 @@ func TestEfficiencyCompactResultNoDuplication(t *testing.T) {
 }
 
 func TestEfficiencyCompatTextMode(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClientOpt(t, cl, "/proj", Options{CompatText: true})
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClientOpt(t, ds, Options{CompatText: true})
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "test_echo", Arguments: map[string]any{"a": 1}})
+		Name: "test_echo", Arguments: map[string]any{"project_code": "TEST", "a": 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +239,8 @@ func TestEfficiencyCompatTextMode(t *testing.T) {
 }
 
 func TestEfficiencyFullSchemasMode(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClientOpt(t, cl, "/proj", Options{FullSchemas: true})
+	ds, _ := stubDaemon(t)
+	cs := mcpClientOpt(t, ds, Options{FullSchemas: true})
 	tl, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -246,10 +264,11 @@ func TestEfficiencyFullSchemasMode(t *testing.T) {
 // ---- errors -----------------------------------------------------------------
 
 func TestEfficiencyErrorBudget(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj")
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "test_strict", Arguments: map[string]any{"x": "bad"}})
+		Name: "test_strict", Arguments: map[string]any{"project_code": "TEST", "x": "bad"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +298,6 @@ func TestEfficiencyErrorBudget(t *testing.T) {
 // ---- progress ---------------------------------------------------------------
 
 func TestEfficiencyProgressDedupe(t *testing.T) {
-	reg := op.NewRegistry()
 	dup := &op.Operation{
 		Name: "test.dupprog", Summary: "Repeats one stage", Stream: true,
 		Handler: func(_ context.Context, _ json.RawMessage, sink op.Sink) (any, error) {
@@ -290,17 +308,10 @@ func TestEfficiencyProgressDedupe(t *testing.T) {
 			return map[string]any{"ok": true}, nil
 		},
 	}
-	if err := reg.AddRaw(dup, []byte(`{"type":"object","$id":"test.dupprog/in"}`), []byte(`{"type":"object","$id":"test.dupprog/out"}`)); err != nil {
-		t.Fatal(err)
-	}
-	ds := daemon.NewServer(core.NewRuntime(false), reg, nil)
-	httpSrv := httptest.NewServer(ds.Handler())
-	t.Cleanup(httpSrv.Close)
-	cl := client.NewClient(&daemon.Discovery{
-		Protocol: daemon.Protocol, Endpoint: httpSrv.URL, PID: 1, Token: ds.Token(),
-	}, t.TempDir())
+	ds, _ := stubDaemon(t, dup)
+	registerProject(t, "TEST", "test-proj")
 
-	fe, err := New(context.Background(), cl, "/proj")
+	fe, err := New(context.Background(), ds, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,13 +332,24 @@ func TestEfficiencyProgressDedupe(t *testing.T) {
 	}
 	defer cs.Close()
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "test_dupprog", Arguments: map[string]any{}, Meta: mcp.Meta{"progressToken": "p"},
+		Name: "test_dupprog", Arguments: map[string]any{"project_code": "TEST"}, Meta: mcp.Meta{"progressToken": "p"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.IsError {
 		t.Fatal("op failed")
+	}
+	// Drain the client's async notification loop before counting.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(msgs)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -355,7 +377,6 @@ func TestEfficiencyProgressDedupe(t *testing.T) {
 // ---- artifacts --------------------------------------------------------------
 
 func TestEfficiencyArtifactNoInline(t *testing.T) {
-	reg := op.NewRegistry()
 	shot := &op.Operation{
 		Name: "test.shot", Summary: "Artifact-by-reference", Stream: true,
 		Handler: func(_ context.Context, _ json.RawMessage, sink op.Sink) (any, error) {
@@ -366,17 +387,11 @@ func TestEfficiencyArtifactNoInline(t *testing.T) {
 			}, nil
 		},
 	}
-	if err := reg.AddRaw(shot, []byte(`{"type":"object","$id":"test.shot/in"}`), []byte(`{"type":"object","$id":"test.shot/out"}`)); err != nil {
-		t.Fatal(err)
-	}
-	ds := daemon.NewServer(core.NewRuntime(false), reg, nil)
-	httpSrv := httptest.NewServer(ds.Handler())
-	t.Cleanup(httpSrv.Close)
-	cl := client.NewClient(&daemon.Discovery{
-		Protocol: daemon.Protocol, Endpoint: httpSrv.URL, PID: 1, Token: ds.Token(),
-	}, t.TempDir())
-	cs := mcpClient(t, cl, "/proj")
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "test_shot", Arguments: map[string]any{}})
+	ds, _ := stubDaemon(t, shot)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_shot", Arguments: map[string]any{"project_code": "TEST"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,8 +411,9 @@ func TestEfficiencyArtifactNoInline(t *testing.T) {
 
 // repDaemon registers stub ops returning realistic Spin Tower-shaped results
 // so serialized CallToolResult sizes are gated deterministically.
-func repDaemon(t *testing.T) *client.Client {
+func repDaemon(t *testing.T) *daemon.Server {
 	t.Helper()
+	t.Setenv("GAME_FORGE_HOME", t.TempDir())
 	reg := op.NewRegistry()
 	obj := []byte(`{"type":"object","$id":"rep/x"}`)
 	reps := map[string]any{
@@ -475,17 +491,13 @@ func repDaemon(t *testing.T) *client.Client {
 			t.Fatal(err)
 		}
 	}
-	ds := daemon.NewServer(core.NewRuntime(false), reg, nil)
-	httpSrv := httptest.NewServer(ds.Handler())
-	t.Cleanup(httpSrv.Close)
-	return client.NewClient(&daemon.Discovery{
-		Protocol: daemon.Protocol, Endpoint: httpSrv.URL, PID: 1, Token: ds.Token(),
-	}, t.TempDir())
+	return daemon.NewServer(core.NewRuntime(false), reg, nil)
 }
 
 func TestEfficiencyRepresentativeResults(t *testing.T) {
-	cl := repDaemon(t)
-	cs := mcpClient(t, cl, "/proj")
+	ds := repDaemon(t)
+	registerProject(t, "REP", "rep-proj")
+	cs := mcpClient(t, ds)
 	b, err := LoadBudget()
 	if err != nil {
 		t.Fatal(err)
@@ -503,7 +515,8 @@ func TestEfficiencyRepresentativeResults(t *testing.T) {
 		"rep_profile_run":      "profile_run",
 	}
 	for stub, budgetKey := range repToBudget {
-		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: stub, Arguments: map[string]any{}})
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name: stub, Arguments: map[string]any{"project_code": "REP"}})
 		if err != nil {
 			t.Fatalf("%s: %v", stub, err)
 		}
@@ -572,12 +585,55 @@ func TestCompactSchema(t *testing.T) {
 	}
 }
 
+// TestInjectProjectCode pins the transport-property injection: required,
+// compact, and never mutating the canonical document.
+func TestInjectProjectCode(t *testing.T) {
+	in := json.RawMessage(`{"$id":"x","type":"object","required":["id"],"properties":{"id":{"type":"string"}}}`)
+	out := injectProjectCode(compactSchema(in))
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	props, _ := doc["properties"].(map[string]any)
+	pc, _ := props["project_code"].(map[string]any)
+	if pc["type"] != "string" {
+		t.Fatalf("project_code projection wrong: %v", pc)
+	}
+	// Compact: no long repeated description.
+	if len(pc) > 1 {
+		t.Fatalf("project_code carries more than its type: %v", pc)
+	}
+	req, _ := doc["required"].([]any)
+	var found bool
+	for _, r := range req {
+		if r == "project_code" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("project_code not required")
+	}
+	// Canonical document untouched.
+	var canon map[string]any
+	json.Unmarshal(in, &canon)
+	if canon["$id"] == nil {
+		t.Fatal("canonical schema was mutated")
+	}
+	// Schemas without properties/required still gain both.
+	out2 := injectProjectCode(compactSchema(json.RawMessage(`{"type":"object","$id":"y"}`)))
+	var doc2 map[string]any
+	json.Unmarshal(out2, &doc2)
+	if doc2["properties"] == nil || doc2["required"] == nil {
+		t.Fatalf("injection failed on sparse schema: %v", doc2)
+	}
+}
+
 func containsRefJSON(raw json.RawMessage) bool {
 	var v any
 	if json.Unmarshal(raw, &v) != nil {
 		return false
 	}
-	return containsRef(v)
+	return hasRef(v)
 }
 
 func schemasForTest(name string) (in, out json.RawMessage, err error) {
@@ -588,8 +644,9 @@ func schemasForTest(name string) (in, out json.RawMessage, err error) {
 // ---- audit ------------------------------------------------------------------
 
 func TestAuditReportPasses(t *testing.T) {
-	cl, _ := realDaemon(t)
-	rep, err := Audit(context.Background(), cl)
+	_, disp := realDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	rep, err := Audit(context.Background(), disp, "TEST")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,8 +661,14 @@ func TestAuditReportPasses(t *testing.T) {
 	if rep.Tools == 0 || rep.CatalogBytes == 0 || rep.ModelSurfaceBytes == 0 {
 		t.Fatalf("audit missing measurements: %+v", rep)
 	}
+	if rep.ProjectCodeBytes == 0 {
+		t.Fatal("audit did not measure project_code overhead")
+	}
 	if rep.InitHTTPRequests > 2 {
 		t.Fatalf("audit init made %d requests", rep.InitHTTPRequests)
+	}
+	if !rep.ProbeOK {
+		t.Fatal("probe call did not succeed through the registered project")
 	}
 	if len(rep.Largest) == 0 {
 		t.Fatal("audit did not report largest tools")
@@ -620,7 +683,7 @@ func TestAuditReportPasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, k := range []string{"status", "tools", "catalogBytes", "modelSurfaceBytes",
-		"initHTTPRequests", "warmInitMs", "gates", "largestTools"} {
+		"projectCodeBytes", "initHTTPRequests", "warmInitMs", "gates", "largestTools"} {
 		if doc[k] == nil {
 			t.Errorf("audit JSON missing key %q", k)
 		}
@@ -628,12 +691,13 @@ func TestAuditReportPasses(t *testing.T) {
 }
 
 // TestEfficiencyWarmLatency measures warm init and a trivial call through the
-// real daemon handler. Hard ceilings gate; soft targets are logged.
+// real daemon dispatcher. Hard ceilings gate; soft targets are logged.
 func TestEfficiencyWarmLatency(t *testing.T) {
-	cl, _ := realDaemon(t)
+	ds, _ := realDaemon(t)
+	registerProject(t, "TEST", "test-proj")
 	b, _ := LoadBudget()
 	t0 := time.Now()
-	fe, err := New(context.Background(), cl, t.TempDir())
+	fe, err := New(context.Background(), ds, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,11 +719,14 @@ func TestEfficiencyWarmLatency(t *testing.T) {
 	var lat []int64
 	for i := 0; i < 9; i++ {
 		s := time.Now()
-		_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-			Name: "resource_list", Arguments: map[string]any{}})
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name: "resource_list", Arguments: map[string]any{"project_code": "TEST"}})
 		lat = append(lat, time.Since(s).Milliseconds())
 		if err != nil {
 			t.Fatal(err)
+		}
+		if res.IsError {
+			t.Fatalf("trivial call failed: %+v", res.Content)
 		}
 	}
 	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })

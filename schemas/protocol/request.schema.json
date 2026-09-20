@@ -9,6 +9,7 @@
     "id": { "type": "string" },
     "op": { "type": "string", "minLength": 1 },
     "cwd": { "type": "string" },
+    "project": { "type": "string", "minLength": 1, "maxLength": 16 },
     "args": { "type": "object" }
   },
   "additionalProperties": false

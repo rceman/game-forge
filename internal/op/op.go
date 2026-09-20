@@ -40,6 +40,13 @@ const (
 	CodeCanceled       = "canceled"
 	CodeFailed         = "failed"
 	CodeInternal       = "internal"
+
+	// Project-selector errors. A registered project code may be unknown, its
+	// directory may have disappeared, or the directory may now contain a
+	// different project than the one registered.
+	CodeUnknownProject     = "unknown_project"
+	CodeProjectUnavailable = "project_unavailable"
+	CodeProjectChanged     = "project_changed"
 )
 
 // Request is the canonical control request envelope. It is deliberately terse
@@ -54,6 +61,11 @@ type Request struct {
 	// Cwd is the client's working directory. The daemon has its own, so project
 	// discovery must be told where the caller was.
 	Cwd string `json:"cwd,omitempty"`
+	// Project selects a registered project by its stable code (e.g. "TDG").
+	// It is transport metadata: the daemon resolves it to the registered
+	// canonical root before dispatch. Exactly one of Cwd or Project may be
+	// set on a request that needs project context.
+	Project string `json:"project,omitempty"`
 	// Args is the operation's own argument object.
 	Args json.RawMessage `json:"args,omitempty"`
 }
@@ -114,6 +126,18 @@ func (NopSink) Stage(string, string, int64, string) {}
 
 // Artifact implements Sink.
 func (NopSink) Artifact(string, string, string) {}
+
+// Meta is one operation's canonical contract as advertised to frontends: the
+// daemon's /v1/catalog response, the daemon's in-process MCP dispatcher and
+// the daemon client's HTTP adapter all use this single shape so tool
+// construction is driven by the registry, never a second copy.
+type Meta struct {
+	Op      string          `json:"op"`
+	Summary string          `json:"summary"`
+	Stream  bool            `json:"stream"`
+	Input   json.RawMessage `json:"input"`
+	Output  json.RawMessage `json:"output"`
+}
 
 // Handler is the single Core implementation of an operation.
 //

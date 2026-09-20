@@ -3,7 +3,8 @@ package mcpfrontend
 import (
 	"context"
 	"encoding/json"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,17 +12,20 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/rceman/game-forge/internal/client"
 	"github.com/rceman/game-forge/internal/core"
 	"github.com/rceman/game-forge/internal/daemon"
 	"github.com/rceman/game-forge/internal/op"
+	"github.com/rceman/game-forge/internal/project"
 )
 
-// stubDaemon stands up a real daemon HTTP handler over a stub registry and
-// returns a client pointed at it. The MCP frontend exercises the same wire it
-// uses against the real game-forged.
-func stubDaemon(t *testing.T, extra ...*op.Operation) (*client.Client, func() int64) {
+// stubDaemon stands up a real daemon (the in-process dispatcher the canonical
+// /mcp endpoint uses) over a stub registry. The MCP frontend exercises the
+// same dispatch path as the streamable-HTTP endpoint.
+func stubDaemon(t *testing.T, extra ...*op.Operation) (*daemon.Server, func() int64) {
 	t.Helper()
+	// Isolate durable state (project registry, MCP token) before the daemon
+	// opens it.
+	t.Setenv("GAME_FORGE_HOME", t.TempDir())
 	reg := op.NewRegistry()
 
 	obj := []byte(`{"type":"object","$id":"x/in"}`)
@@ -77,19 +81,38 @@ func stubDaemon(t *testing.T, extra ...*op.Operation) (*client.Client, func() in
 		}
 	}
 
-	ds := daemon.NewServer(core.NewRuntime(false), reg, nil)
-	httpSrv := httptest.NewServer(ds.Handler())
-	t.Cleanup(httpSrv.Close)
-	cl := client.NewClient(&daemon.Discovery{
-		Protocol: daemon.Protocol, Endpoint: httpSrv.URL, PID: 1, Token: ds.Token(),
-	}, t.TempDir())
-	return cl, func() int64 { mu.Lock(); defer mu.Unlock(); return cancelCount }
+	return daemon.NewServer(core.NewRuntime(false), reg, nil), func() int64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return cancelCount
+	}
 }
 
-// mcpClient connects an in-process MCP client to a fresh frontend bound to cwd.
-func mcpClient(t *testing.T, cl *client.Client, cwd string) *mcp.ClientSession {
+// registerProject creates a minimal valid project in a temp dir and registers
+// it under code, returning the canonical root.
+func registerProject(t *testing.T, code, projectID string) string {
 	t.Helper()
-	fe, err := New(context.Background(), cl, cwd)
+	dir := t.TempDir()
+	manifest := "contract: game-forge/v1\nproject:\n  id: " + projectID + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "game-forge.yaml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := project.OpenRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := reg.Add(code, dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec.Root
+}
+
+// mcpClient connects an in-process MCP client to a fresh frontend bound to
+// the daemon dispatcher — the same wiring the /mcp endpoint uses.
+func mcpClient(t *testing.T, ds *daemon.Server) *mcp.ClientSession {
+	t.Helper()
+	fe, err := New(context.Background(), ds, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,8 +129,8 @@ func mcpClient(t *testing.T, cl *client.Client, cwd string) *mcp.ClientSession {
 }
 
 func TestToolsDeriveFromRegistry(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	cs := mcpClient(t, ds)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -136,8 +159,8 @@ func TestToolsDeriveFromRegistry(t *testing.T) {
 }
 
 func TestToolSchemaIsCanonical(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	fe, err := New(context.Background(), cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	fe, err := New(context.Background(), ds, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +171,7 @@ func TestToolSchemaIsCanonical(t *testing.T) {
 	if in["required"] == nil {
 		t.Fatal("canonical input schema lost 'required'")
 	}
-	cs := mcpClient(t, cl, "/proj/a")
+	cs := mcpClient(t, ds)
 	res, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -162,16 +185,40 @@ func TestToolSchemaIsCanonical(t *testing.T) {
 	if strict == nil {
 		t.Fatal("test_strict tool missing")
 	}
-	// The exposed input schema must equal the deterministic compact
-	// projection of the canonical operation schema — validation-relevant
-	// semantics preserved, wire metadata ($schema/$id) removed.
+	// The exposed input schema equals the deterministic compact projection
+	// of the canonical schema plus the injected transport-level
+	// project_code — validation semantics preserved, wire metadata removed.
 	got, _ := json.Marshal(strict.InputSchema)
 	var want map[string]any
-	json.Unmarshal(compactSchema(meta.Input), &want)
+	json.Unmarshal(injectProjectCode(compactSchema(meta.Input)), &want)
 	var gotM map[string]any
 	json.Unmarshal(got, &gotM)
 	if !jsonEqual(want, gotM) {
 		t.Fatalf("input schema drift:\n canon=%v\n mcp  =%v", want, gotM)
+	}
+	// project_code is a required transport property on every tool.
+	props, _ := gotM["properties"].(map[string]any)
+	if props["project_code"] == nil {
+		t.Fatal("advertised schema lacks project_code")
+	}
+	reqd, _ := gotM["required"].([]any)
+	found := false
+	for _, r := range reqd {
+		if r == "project_code" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("project_code not marked required")
+	}
+	// The canonical schema itself is untouched by the projection.
+	if in["$id"] == nil {
+		t.Fatal("canonical schema metadata was mutated")
+	}
+	for _, r := range in["required"].([]any) {
+		if r == "project_code" {
+			t.Fatal("project_code leaked into the canonical schema")
+		}
 	}
 }
 
@@ -182,11 +229,12 @@ func jsonEqual(a, b map[string]any) bool {
 }
 
 func TestCallEchoStructured(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	root := registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "test_echo",
-		Arguments: map[string]any{"hello": "world"},
+		Arguments: map[string]any{"project_code": "TEST", "hello": "world"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,15 +246,56 @@ func TestCallEchoStructured(t *testing.T) {
 	if !strings.Contains(string(sc), `"hello":"world"`) {
 		t.Fatalf("structured result missing echo: %s", sc)
 	}
-	if !strings.Contains(string(sc), `"cwd":"/proj/a"`) {
-		t.Fatalf("cwd not forwarded: %s", sc)
+	if !strings.Contains(string(sc), `"cwd":"`+root+`"`) {
+		t.Fatalf("project_code did not resolve to registered root: %s", sc)
+	}
+	// project_code is stripped before canonical args reach the op.
+	if strings.Contains(string(sc), "project_code") {
+		t.Fatalf("project_code leaked into canonical args: %s", sc)
+	}
+}
+
+func TestProjectCodeRequired(t *testing.T) {
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_echo", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError when project_code is missing")
+	}
+	txt := res.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(txt, "invalid_args") || !strings.Contains(txt, "project_code") {
+		t.Fatalf("expected invalid_args project_code error, got %q", txt)
+	}
+}
+
+func TestUnknownProjectCode(t *testing.T) {
+	ds, _ := stubDaemon(t)
+	cs := mcpClient(t, ds)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_echo", Arguments: map[string]any{"project_code": "NOPE"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected IsError for unregistered code")
+	}
+	txt := res.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(txt, "unknown_project") || !strings.Contains(txt, "NOPE") {
+		t.Fatalf("expected unknown_project error, got %q", txt)
 	}
 }
 
 func TestCallErrorIsStructured(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "test_fail", Arguments: map[string]any{}})
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_fail", Arguments: map[string]any{"project_code": "TEST"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,10 +312,11 @@ func TestCallErrorIsStructured(t *testing.T) {
 }
 
 func TestCallInvalidArgs(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
-		Name: "test_strict", Arguments: map[string]any{"x": "not-an-int"},
+		Name: "test_strict", Arguments: map[string]any{"project_code": "TEST", "x": "not-an-int"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -241,41 +331,88 @@ func TestCallInvalidArgs(t *testing.T) {
 }
 
 func TestCallUnknownTool(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	cs := mcpClient(t, ds)
 	_, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "nope", Arguments: map[string]any{}})
 	if err == nil {
 		t.Fatal("expected error for unknown tool")
 	}
 }
 
-func TestCwdForwardedPerFrontend(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	csA := mcpClient(t, cl, "/proj/a")
-	csB := mcpClient(t, cl, "/proj/b")
-	for _, tc := range []struct {
-		cs  *mcp.ClientSession
-		cwd string
-	}{{csA, "/proj/a"}, {csB, "/proj/b"}} {
-		res, err := tc.cs.CallTool(context.Background(), &mcp.CallToolParams{
-			Name: "test_echo", Arguments: map[string]any{}})
+// TestProjectRoutingPerCall is the multi-project isolation proof: two
+// registered codes through ONE frontend/dispatcher resolve to their own
+// canonical roots concurrently — no mutable current-project state exists.
+func TestProjectRoutingPerCall(t *testing.T) {
+	ds, _ := stubDaemon(t)
+	rootA := registerProject(t, "AAA", "proj-a")
+	rootB := registerProject(t, "BBB", "proj-b")
+	cs := mcpClient(t, ds)
+
+	var wg sync.WaitGroup
+	errs := make(chan string, 20)
+	call := func(code, want string) {
+		defer wg.Done()
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+			Name: "test_echo", Arguments: map[string]any{"project_code": code}})
 		if err != nil {
-			t.Fatal(err)
+			errs <- err.Error()
+			return
 		}
 		sc, _ := json.Marshal(res.StructuredContent)
-		if !strings.Contains(string(sc), `"cwd":"`+tc.cwd+`"`) {
-			t.Fatalf("frontend did not forward cwd %q: %s", tc.cwd, sc)
+		if !strings.Contains(string(sc), `"cwd":"`+want+`"`) {
+			errs <- "code " + code + " resolved to wrong root: " + string(sc)
 		}
+	}
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go call("AAA", rootA)
+		go call("BBB", rootB)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+}
+
+// TestProjectRegistryLiveUpdate proves the running daemon sees project CRUD
+// without restart: add resolves immediately, remove stops resolving.
+func TestProjectRegistryLiveUpdate(t *testing.T) {
+	ds, _ := stubDaemon(t)
+	root := registerProject(t, "LIVE", "proj-live")
+	cs := mcpClient(t, ds)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_echo", Arguments: map[string]any{"project_code": "LIVE"}})
+	if err != nil || res.IsError {
+		t.Fatalf("call failed: %v %+v", err, res)
+	}
+	sc, _ := json.Marshal(res.StructuredContent)
+	if !strings.Contains(string(sc), `"cwd":"`+root+`"`) {
+		t.Fatalf("wrong root: %s", sc)
+	}
+	reg, _ := project.OpenRegistry()
+	if err := reg.Remove("LIVE"); err != nil {
+		t.Fatal(err)
+	}
+	res, err = cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "test_echo", Arguments: map[string]any{"project_code": "LIVE"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Content[0].(*mcp.TextContent).Text, "unknown_project") {
+		t.Fatalf("expected unknown_project after removal: %+v", res.Content)
 	}
 }
 
 func TestCancellationPropagates(t *testing.T) {
-	cl, cancels := stubDaemon(t)
-	cs := mcpClient(t, cl, "/proj/a")
+	ds, cancels := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	cs := mcpClient(t, ds)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "test_slow", Arguments: map[string]any{}})
+		_, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name: "test_slow", Arguments: map[string]any{"project_code": "TEST"}})
 		done <- err
 	}()
 	time.Sleep(300 * time.Millisecond)
@@ -295,8 +432,9 @@ func TestCancellationPropagates(t *testing.T) {
 }
 
 func TestProgressNotification(t *testing.T) {
-	cl, _ := stubDaemon(t)
-	fe, err := New(context.Background(), cl, "/proj/a")
+	ds, _ := stubDaemon(t)
+	registerProject(t, "TEST", "test-proj")
+	fe, err := New(context.Background(), ds, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +456,7 @@ func TestProgressNotification(t *testing.T) {
 	defer cs.Close()
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "test_progress",
-		Arguments: map[string]any{},
+		Arguments: map[string]any{"project_code": "TEST"},
 		Meta:      mcp.Meta{"progressToken": "ptok-1"},
 	})
 	if err != nil {
@@ -326,6 +464,18 @@ func TestProgressNotification(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatal("progress op failed")
+	}
+	// Notifications ride the client's async read loop; give it a moment to
+	// drain after the synchronous in-process dispatch returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(msgs)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()

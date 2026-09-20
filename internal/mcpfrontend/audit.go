@@ -20,8 +20,6 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/rceman/game-forge/internal/client"
 )
 
 //go:embed efficiency-budget.json
@@ -89,24 +87,34 @@ type Gate struct {
 type Report struct {
 	Status string `json:"status"`
 
-	Tools                  int `json:"tools"`
-	CatalogBytes           int `json:"catalogBytes"`
-	ModelSurfaceBytes      int `json:"modelSurfaceBytes"`
-	NamesBytes             int `json:"namesBytes"`
-	DescriptionsBytes      int `json:"descriptionsBytes"`
-	InputSchemaBytes       int `json:"inputSchemaBytes"`
-	OutputSchemaBytes      int `json:"outputSchemaBytes"`
+	Tools             int `json:"tools"`
+	CatalogBytes      int `json:"catalogBytes"`
+	ModelSurfaceBytes int `json:"modelSurfaceBytes"`
+	NamesBytes        int `json:"namesBytes"`
+	DescriptionsBytes int `json:"descriptionsBytes"`
+	InputSchemaBytes  int `json:"inputSchemaBytes"`
+	OutputSchemaBytes int `json:"outputSchemaBytes"`
+	// ProjectCodeBytes is the serialized cost of the injected project_code
+	// transport property across all tools.
+	ProjectCodeBytes       int `json:"projectCodeBytes"`
 	MaxDescriptionPerTool  int `json:"maxDescriptionPerTool"`
 	AvgToolBytes           int `json:"avgToolBytes"`
 	EstimatedSurfaceTokens int `json:"estimatedSurfaceTokens"`
 
+	// InitHTTPRequests counts daemon HTTP round trips during frontend
+	// construction. The in-process dispatcher (canonical /mcp) uses 0; the
+	// HTTP adapter uses 1 catalog request.
 	InitHTTPRequests int   `json:"initHTTPRequests"`
 	WarmInitMs       int64 `json:"warmInitMs"`
 	WarmReadyMs      int64 `json:"warmReadyMs"`
 
 	// Probe is one trivial real call (resource_list: side-effect-free, no
-	// project, browser or server needed) measuring the result envelope.
+	// browser or server needed) measuring the result envelope. When no
+	// project is registered the probe exercises the error path instead —
+	// still a real serialized CallToolResult.
 	ProbeTool           string `json:"probeTool"`
+	ProbeProject        string `json:"probeProject"`
+	ProbeOK             bool   `json:"probeOK"`
 	ProbeResultBytes    int    `json:"probeResultBytes"`
 	ProbeStructuredByte int    `json:"probeStructuredBytes"`
 	ProbeTextBytes      int    `json:"probeTextBytes"`
@@ -122,23 +130,24 @@ type Report struct {
 
 // Audit measures the MCP efficiency surface against the checked-in budget.
 // Discovery is metadata-only: no tool that starts a browser, dev server or
-// GPU probe is invoked. The one call probe is resource_list — a read-only
-// daemon operation needing no project.
-func Audit(ctx context.Context, cl *client.Client) (*Report, error) {
+// GPU probe is invoked. The call probe is resource_list — read-only — routed
+// to probeCode; with no registered project the probe measures the
+// unknown_project error path, which is still a bounded result.
+func Audit(ctx context.Context, disp Dispatcher, probeCode string) (*Report, error) {
 	b, err := LoadBudget()
 	if err != nil {
 		return nil, err
 	}
 	rep := &Report{Status: "PASS"}
 
-	reqs0 := cl.Requests()
+	reqs0 := disp.Requests()
 	t0 := time.Now()
-	fe, err := New(ctx, cl, "")
+	fe, err := New(ctx, disp, Options{})
 	if err != nil {
 		return nil, err
 	}
 	rep.WarmInitMs = time.Since(t0).Milliseconds()
-	rep.InitHTTPRequests = int(cl.Requests() - reqs0)
+	rep.InitHTTPRequests = int(disp.Requests() - reqs0)
 
 	st, ct := mcp.NewInMemoryTransports()
 	go fe.Run(ctx, st)
@@ -187,6 +196,11 @@ func Audit(ctx context.Context, cl *client.Client) (*Report, error) {
 	if rep.Tools > 0 {
 		rep.AvgToolBytes = totalTool / rep.Tools
 	}
+	// project_code overhead = the injected transport property's serialized
+	// cost across the whole catalog (input schema delta per tool).
+	for _, meta := range fe.metas {
+		rep.ProjectCodeBytes += len(injectProjectCode(compactSchema(meta.Input))) - len(compactSchema(meta.Input))
+	}
 	// Model surface = what an LLM needs to choose and call a tool:
 	// name + description + input schema (output schemas are daemon-side
 	// validation metadata in compact mode and excluded).
@@ -197,7 +211,7 @@ func Audit(ctx context.Context, cl *client.Client) (*Report, error) {
 		rep.Largest = rep.Largest[:5]
 	}
 
-	rep.probe(ctx, cs, &progMu)
+	rep.probe(ctx, cs, probeCode, &progMu)
 
 	rep.Gates = []Gate{
 		gate("catalogBytes", b.MaxCatalogBytes, rep.CatalogBytes),
@@ -224,18 +238,19 @@ func Audit(ctx context.Context, cl *client.Client) (*Report, error) {
 // probe times trivial resource_list calls and inspects the real serialized
 // CallToolResult: duplication, text fallback and progress volume. prog carries
 // the client's progress-notification counters.
-func (rep *Report) probe(ctx context.Context, cs *mcp.ClientSession, prog *struct {
+func (rep *Report) probe(ctx context.Context, cs *mcp.ClientSession, code string, prog *struct {
 	n     int
 	bytes int
 }) {
 	rep.ProbeTool = "resource_list"
+	rep.ProbeProject = code
 	var lat []int64
 	const n = 7
 	for i := 0; i < n; i++ {
 		t0 := time.Now()
 		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
 			Name:      "resource_list",
-			Arguments: map[string]any{},
+			Arguments: map[string]any{"project_code": code},
 			Meta:      mcp.Meta{"progressToken": "audit-probe"},
 		})
 		lat = append(lat, time.Since(t0).Milliseconds())
@@ -243,6 +258,7 @@ func (rep *Report) probe(ctx context.Context, cs *mcp.ClientSession, prog *struc
 			continue
 		}
 		if i == 0 {
+			rep.ProbeOK = !res.IsError
 			wire, _ := json.Marshal(res)
 			rep.ProbeResultBytes = len(wire)
 			sb, _ := json.Marshal(res.StructuredContent)
@@ -300,12 +316,13 @@ func (r *Report) Render(w io.Writer) int {
 	fmt.Fprintf(w, "  tools:             %d\n", r.Tools)
 	fmt.Fprintf(w, "  model surface:     %s (~%d tok)\n", size(r.ModelSurfaceBytes), r.EstimatedSurfaceTokens)
 	fmt.Fprintf(w, "  full catalog:      %s\n", size(r.CatalogBytes))
+	fmt.Fprintf(w, "  project_code cost: %s\n", size(r.ProjectCodeBytes))
 	fmt.Fprintf(w, "  descriptions:      %s\n", size(r.DescriptionsBytes))
 	fmt.Fprintf(w, "  init HTTP calls:   %d\n", r.InitHTTPRequests)
 	fmt.Fprintf(w, "  warm init/ready:   %d ms / %d ms\n", r.WarmInitMs, r.WarmReadyMs)
 	fmt.Fprintf(w, "  duplicate output:  %s\n", size(r.ProbeDuplicateBytes))
-	fmt.Fprintf(w, "  probe %s: %s, p50 %d ms, p95 %d ms\n",
-		r.ProbeTool, size(r.ProbeResultBytes), r.ProbeP50Ms, r.ProbeP95Ms)
+	fmt.Fprintf(w, "  probe %s[%s]: %s, p50 %d ms, p95 %d ms\n",
+		r.ProbeTool, r.ProbeProject, size(r.ProbeResultBytes), r.ProbeP50Ms, r.ProbeP95Ms)
 	for i, ts := range r.Largest {
 		if i >= 3 {
 			break

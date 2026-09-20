@@ -37,9 +37,9 @@ validation profiles, production smoke, GPU verification and benchmarking, an
 owned-resource registry, and a per-user control daemon that owns housekeeping.
 
 Every externally callable capability is a schema-defined **operation** behind a
-single Operation Registry. The CLI and the MCP stdio server are thin frontends
-that talk to a persistent per-user daemon (`game-forged`) over loopback HTTP;
-the daemon owns resource lifecycle and periodic housekeeping. See
+single Operation Registry. The CLI and MCP frontends are thin layers that talk
+to one persistent per-user daemon (`game-forged`) over loopback HTTP; the
+daemon owns resource lifecycle and periodic housekeeping. See
 [Roadmap](docs/ROADMAP.md),
 [Daemon protocol](docs/DAEMON_PROTOCOL_V1.md), and the
 [Spin Tower migration matrix](docs/SPIN_TOWER_MIGRATION.md).
@@ -123,14 +123,66 @@ game-forge ps                  # list resources owned by Game Forge
 game-forge gc                  # reclaim expired owned resources
 game-forge tick                # one idempotent housekeeping pass
 
-game-forge daemon status|stop|restart  # control the per-user daemon
-game-forge mcp serve [--cwd DIR] [--compat-text] [--full-schemas]
-                                       # expose Game Forge over MCP stdio
-game-forge mcp audit [--json]          # MCP wire-efficiency surface vs budget
+game-forge daemon status|stop|restart|rebind  # control the per-user daemon
+game-forge mcp info [--json] [--show-token]    # the canonical MCP endpoint
+game-forge mcp serve                           # stdio compatibility frontend
+game-forge mcp audit [--json]                  # MCP wire-efficiency vs budget
 
 game-forge version
 game-forge help
 ```
+
+## Projects and MCP
+
+MCP agents select a project per call by code — there is no session, no
+"current project", and no per-project MCP process. Register once on this
+machine:
+
+```sh
+cd ~/git/td-game
+game-forge project add TDG        # shorthand: discover the project from cwd
+# or explicitly, from anywhere:
+game-forge project add --code TDG --folder ~/git/td-game
+
+game-forge project list
+game-forge project show TDG
+game-forge project remove TDG
+```
+
+`project add` walks upward to the directory containing `game-forge.yaml`, so
+it works from any nested directory, and refuses to silently remap an existing
+code — pass `--replace` to update deliberately. The registry lives at
+`~/.game-forge/state/projects.json` and is read by the daemon on every call,
+so changes are visible immediately.
+
+Three identities stay distinct: the **code** (`TDG`) is a stable alias you
+choose; the **root** is the machine-local manifest directory; the
+**project key** (`spin-tower-37de03`) is the internal collision-safe resource
+identity.
+
+The daemon binds **one durable loopback port** (`50000-59999`, persisted in
+`~/.game-forge/state/endpoint.json`) and rebinds it across restarts, so an MCP
+client is configured once:
+
+```json
+{ "url": "http://127.0.0.1:<port>/mcp" }
+```
+
+`/mcp` requires the durable MCP credential (`~/.game-forge/state/mcp.token`,
+shown by `game-forge mcp info --show-token`) and rejects non-local `Origin`
+headers. Every tool takes a required `project_code` argument:
+
+```text
+project_info(project_code="TDG")
+scenario_run(project_code="TDG", id="weapons")
+visual_shot(project_code="TDG", case="starting-tower")
+```
+
+If the persisted port is ever occupied at startup the daemon fails loudly —
+run `game-forge daemon rebind` to choose a new port deliberately (MCP client
+config then points at the new endpoint; the port never moves silently).
+`mcp serve` remains as a stdio compatibility frontend over the same daemon
+and the same per-call `project_code` routing.
 
 Most commands accept `--json` for a structured result and `--ndjson` for the
 raw event stream. Ordinary commands transparently start and reuse the daemon;

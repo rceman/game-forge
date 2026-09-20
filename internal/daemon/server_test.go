@@ -16,9 +16,12 @@ import (
 
 const testToken = "test-secret"
 
-// testServer builds a daemon HTTP handler over a stub registry.
+// testServer builds a daemon HTTP handler over a stub registry. It isolates
+// GAME_FORGE_HOME first: the server now opens the durable project registry and
+// MCP credential there at construction.
 func testServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Helper()
+	t.Setenv("GAME_FORGE_HOME", t.TempDir())
 	reg := op.NewRegistry()
 
 	obj := []byte(`{"type":"object","$id":"t/in"}`)

@@ -180,7 +180,7 @@ func cmdServe(args []string) (*call, int, bool) {
 // cmdProject → project.info
 func cmdProject(args []string) (*call, int, bool) {
 	if len(args) == 0 || args[0] != "info" {
-		fmt.Fprintln(os.Stderr, "game-forge project: expected subcommand (info)")
+		fmt.Fprintln(os.Stderr, "game-forge project: expected subcommand (info|add|list|show|remove)")
 		return nil, ExitUsage, true
 	}
 	fs := cmdFlags("project info")

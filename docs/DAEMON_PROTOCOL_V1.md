@@ -17,22 +17,24 @@ single Operation Registry. One operation has:
 The daemon's HTTP layer is a thin transport: authenticate, decode, schema
 validate, dispatch to the registry, encode or stream. It contains no operation
 semantics. The CLI is another adapter over the same registry — it parses
-familiar syntax into a request and renders the result. A future MCP frontend
-enumerates the same registry and calls the same handlers; it never parses CLI
-output and never re-declares schemas.
+familiar syntax into a request and renders the result. The MCP frontends
+enumerate the same registry and call the same handlers; they never parse CLI
+output and never re-declare schemas.
 
 ## 2. Transport
 
-One cross-platform mechanism: **HTTP over loopback TCP on a dynamic
-OS-assigned port**.
+One cross-platform mechanism: **HTTP over loopback TCP on one durable port**.
 
-```go
-net.Listen("tcp", "127.0.0.1:0")
-```
-
-- Binds only `127.0.0.1`. Never `0.0.0.0`. No fixed port.
-- No Unix-socket / named-pipe variants; no public listener.
-- No CORS: this is a local control API, not a browser-facing web API.
+- Binds only `127.0.0.1`. Never `0.0.0.0`. No public listener.
+- The port lives in `50000-59999`. First start scans from a randomized offset,
+  binds the first free port, and persists it in
+  `~/.game-forge/state/endpoint.json` (durable state, non-secret).
+- Every later incarnation rebinds **exactly** the persisted port — an MCP
+  client configured against `http://127.0.0.1:<port>/mcp` stays valid across
+  restarts. If the persisted port is occupied, startup fails with a clear
+  error naming the port; `game-forge daemon rebind` is the explicit recovery —
+  the port never moves silently.
+- No Unix-socket / named-pipe variants.
 - Works identically on Linux, WSL, Windows and macOS.
 
 ## 3. Discovery
@@ -58,16 +60,28 @@ After binding, the daemon writes `~/.game-forge/run/daemon.json` **atomically**
 
 ## 4. Authentication
 
-Loopback is not authorization. Each daemon incarnation generates a
-**cryptographically random 256-bit bearer token**, stored only in
-`daemon.json` with owner-only permissions. Every endpoint requires:
+Loopback is not authorization. There are **two deliberately separate
+credentials**:
+
+- **Control-API token** — a cryptographically random 256-bit bearer token
+  generated per daemon incarnation, stored only in `daemon.json` (0600).
+  Authorizes `/health`, `/v1/*`. It is never logged, printed, committed, or
+  placed in project configuration.
+- **Durable MCP credential** — a cryptographically random 256-bit token
+  persisted at `~/.game-forge/state/mcp.token` (0600), stable across daemon
+  incarnations because MCP clients are configured once. Authorizes `/mcp`
+  only; it does NOT authorize the control API, and the ephemeral token does
+  NOT authorize `/mcp`. It is never emitted in ordinary output — explicit
+  `game-forge mcp info --show-token` displays it.
 
 ```text
 Authorization: Bearer <token>
 ```
 
-Missing or wrong token → `401` with a structured error body. The token is never
-logged, printed, committed, or placed in project configuration.
+Missing or wrong credential → `401` with a structured error body. `/mcp`
+additionally rejects requests whose `Origin` header names a non-local host
+(`403`) — a DNS-rebinding guard against hostile pages driving the local
+endpoint through the user's browser.
 
 ## 5. Endpoints
 
@@ -82,6 +96,7 @@ semantic namespace, so there is no large REST hierarchy.
 | `GET`  | `/v1/schema/<op>` | One operation's contract: `{op, summary, stream, input, output}`. Kept for debugging/external clients. |
 | `POST` | `/v1/run` | Execute one operation (JSON or NDJSON). |
 | `POST` | `/v1/shutdown` | Graceful stop. |
+| `POST` | `/mcp` | Streamable-HTTP MCP endpoint (durable credential). Serves the same operations as MCP tools through the daemon's in-process dispatcher — identical pipeline to `/v1/run`, no HTTP loop. |
 
 ## 6. Request envelope
 
@@ -104,8 +119,41 @@ Compact but readable. `POST /v1/run` body:
 - `op` — canonical operation name.
 - `cwd` — the caller's working directory. The daemon has its own, so project
   discovery is told where the caller was. Transport metadata, not semantics.
+- `project` — a registered project code (e.g. `"TDG"`). Mutually exclusive
+  with `cwd` (`invalid_request` if both are sent). The daemon resolves it
+  through the durable project registry to the registered canonical root
+  before validation — see §6a. MCP calls always use this selector.
 - `args` — the operation's own argument object, validated against its input
-  schema.
+  schema. `project` never reaches the operation's canonical schema.
+
+### 6a. Project registry
+
+The durable machine-local registry (`~/.game-forge/state/projects.json`) maps
+stable codes to project roots:
+
+```text
+game-forge project add TDG                          # discover from cwd upward
+game-forge project add --code TDG --folder ~/git/td-game
+game-forge project list | show TDG | remove TDG
+```
+
+Registration discovers the manifest directory (walks up to `game-forge.yaml`),
+canonicalizes it, loads the manifest, and records `{code, root, projectId,
+projectKey}` — the key is the existing collision-safe identity, reused, not
+reinvented. Registration is local admin state: it never requires the daemon,
+and a running daemon sees changes immediately because resolution re-reads the
+registry per request.
+
+Resolution failures are structured:
+
+- `unknown_project` — the code is not registered (400).
+- `project_unavailable` — the registered root is missing/unloadable (400).
+- `project_changed` — the manifest's identity no longer matches the
+  registration; re-register with `--replace` (400).
+
+There are no project sessions: no `session_start`, no `session_use`, no
+session id. `project_code` on each MCP call (mapped to `project` in the
+envelope) is the complete selection mechanism.
 
 ## 7. Response envelope
 
@@ -128,11 +176,14 @@ report) but the command exits non-zero.
 ### Error codes
 
 `invalid_request`, `unsupported_version`, `unknown_op`, `invalid_args`,
-`invalid_output`, `canceled`, `failed`, `internal`. These are stable.
+`invalid_output`, `unknown_project`, `project_unavailable`, `project_changed`,
+`canceled`, `failed`, `internal`. These are stable.
 
 - `invalid_args` — args failed the operation's input schema (client error).
 - `invalid_output` — the handler produced a schema-invalid result (contract
   bug; it is never sent as if valid).
+- `unknown_project` / `project_unavailable` / `project_changed` — the
+  `project` selector failed registry resolution (§6a).
 - `internal` — a daemon/protocol fault.
 
 ## 8. NDJSON streaming

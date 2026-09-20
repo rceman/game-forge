@@ -148,6 +148,46 @@ func (c *Client) Stream(ctx context.Context, opName string, args any, onEvent fu
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeInternal, Msg: err.Error()}
 	}
+	return c.streamRequest(ctx, reqBody, onEvent)
+}
+
+// RunRequest executes one canonical request envelope — including its project
+// selector — and reports semantic progress to sink. It backs the MCP
+// frontend's HTTP dispatcher so stdio MCP calls run the same /v1/run pipeline.
+func (c *Client) RunRequest(ctx context.Context, req *op.Request, sink op.Sink) (any, *op.Error) {
+	if req.V == 0 {
+		req.V = schemas.Version
+	}
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, &op.Error{Code: op.CodeInternal, Msg: err.Error()}
+	}
+	raw, werr := c.streamRequest(ctx, reqBody, func(ev op.Event) {
+		if sink == nil {
+			return
+		}
+		switch ev.Ev {
+		case op.EvStage:
+			detail, _ := ev.Data.(string)
+			sink.Stage(ev.Name, ev.Status, ev.MS, detail)
+		case op.EvArtifact:
+			sink.Artifact(ev.Kind, ev.Ref, ev.Path)
+		}
+	})
+	if werr != nil {
+		return nil, werr
+	}
+	var data any
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return nil, &op.Error{Code: op.CodeInternal, Msg: "decode result: " + err.Error()}
+		}
+	}
+	return data, nil
+}
+
+// streamRequest posts one encoded envelope to /v1/run with NDJSON streaming.
+func (c *Client) streamRequest(ctx context.Context, reqBody []byte, onEvent func(op.Event)) (json.RawMessage, *op.Error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.d.Endpoint+"/v1/run", bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeInternal, Msg: err.Error()}
@@ -237,19 +277,8 @@ func (c *Client) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// OpSchema is the canonical contract document for one operation, as served by
-// GET /v1/schema/<op>. The MCP frontend builds tools directly from these so
-// the exposed schemas are exactly what the daemon validates and executes.
-type OpSchema struct {
-	Op      string          `json:"op"`
-	Summary string          `json:"summary"`
-	Stream  bool            `json:"stream"`
-	Input   json.RawMessage `json:"input"`
-	Output  json.RawMessage `json:"output"`
-}
-
 // Schema returns the canonical input/output contract for one operation.
-func (c *Client) Schema(ctx context.Context, opName string) (*OpSchema, error) {
+func (c *Client) Schema(ctx context.Context, opName string) (*op.Meta, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.d.Endpoint+"/v1/schema/"+opName, nil)
 	if err != nil {
 		return nil, err
@@ -260,7 +289,7 @@ func (c *Client) Schema(ctx context.Context, opName string) (*OpSchema, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var v OpSchema
+	var v op.Meta
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
 		return nil, err
 	}
@@ -272,9 +301,9 @@ func (c *Client) Schema(ctx context.Context, opName string) (*OpSchema, error) {
 // schema request per operation; it also carries the protocol identity needed
 // for the compatibility check.
 type Catalog struct {
-	V        int        `json:"v"`
-	Protocol string     `json:"protocol"`
-	Ops      []OpSchema `json:"ops"`
+	V        int       `json:"v"`
+	Protocol string    `json:"protocol"`
+	Ops      []op.Meta `json:"ops"`
 }
 
 // Catalog returns the daemon's full operation catalog.

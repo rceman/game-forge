@@ -1,323 +1,366 @@
-// Package mcpfrontend is the MCP frontend for Game Forge.
+// Package mcpfrontend is the thin MCP adapter over the Operation Registry.
 //
-// It is deliberately thin: it exposes the daemon's canonical operations as MCP
-// tools, translates MCP calls into Game Forge operation requests, and maps
-// results/errors/progress back. It owns no browser, server, registry or
-// operation semantics — the per-user daemon remains the single lifecycle
-// owner, and the Operation Registry remains the single source of tool
-// metadata and schemas.
+// The MCP frontend never implements operation semantics and never owns a
+// second Core/runtime: it asks a Dispatcher (the daemon's in-process
+// dispatcher on the canonical /mcp endpoint, or the daemon HTTP client for
+// stdio compatibility) for the canonical operation catalog and forwards each
+// tool call to the daemon, which remains the canonical validator and the sole
+// owner of project, browser and server resources.
 //
-//	MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
-//	  -> Operation Registry -> Core
-//
-// Efficiency is part of correctness for an agent-facing interface: the
-// frontend keeps the model-facing surface dense by serving compact tool
-// definitions, omitting output schemas (the daemon still validates results
-// canonically), never duplicating a structured result into text content, and
-// deduplicating progress.
+// Project selection is transport metadata: every tool accepts a required
+// "project_code" argument that resolves against the durable project registry.
+// The frontend extracts it before canonical argument validation and forwards
+// it on the request envelope — canonical operation schemas never see it.
+// There are no sessions or hidden current-project state; every call names
+// its project, so concurrent calls for different projects never cross.
 package mcpfrontend
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync/atomic"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/rceman/game-forge/internal/client"
-	"github.com/rceman/game-forge/internal/daemon"
+	mcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rceman/game-forge/internal/op"
 	"github.com/rceman/game-forge/schemas"
 )
 
-// Version is the MCP server implementation version reported to clients,
-// overridable at build time.
-var Version = "0.1.0-dev"
+// Version is the MCP server implementation version, set by the CLI at startup.
+var Version = "dev"
 
-// Wire-efficiency bounds enforced by the frontend itself. The durable numeric
-// budget lives in efficiency-budget.json; these constants bound data the
-// frontend emits per call regardless of catalog size.
-const (
-	// maxErrorText bounds a tool-call error. Canonical errors are already
-	// "code: msg (path)"; the cap exists so an unexpected giant message
-	// (e.g. subprocess output embedded in a failure) cannot flood context.
-	maxErrorText = 512
-	// maxProgressText bounds one progress message so a noisy stage detail
-	// cannot become log spam. Stage details are short by contract.
-	maxProgressText = 200
-)
+// maxErrorText caps an MCP error result; the audit budget asserts it.
+const maxErrorText = 512
 
-// Options tunes the frontend's compatibility surface. The zero value is the
-// compact, agent-oriented mode.
+// maxProgressText caps one progress message; raw logs are never forwarded,
+// only the semantic stage/artifact transitions below.
+const maxProgressText = 200
+
+// Options controls the MCP wire surface.
 type Options struct {
-	// CompatText mirrors the full JSON result into TextContent for clients
-	// that predate structuredContent. Compact mode leaves content empty
-	// because the structured result is authoritative — duplicating it would
-	// double every result's context cost.
+	// CompatText mirrors the structured result into a TextContent entry for
+	// clients that cannot read structuredContent. Default mode emits no text
+	// so the same JSON is never transmitted twice.
 	CompatText bool
-	// FullSchemas advertises each tool's canonical output schema. Compact
-	// mode omits output schemas from tools/list: the model needs name,
-	// description and input schema to choose and call a tool, and daemon-side
-	// output validation is unchanged either way.
+	// FullSchemas advertises canonical output schemas on every tool. Default
+	// mode omits them: a model needs name+description+input schema to choose
+	// and call a tool, and the daemon still validates every result
+	// canonically — the output schema is not needed to pick or call.
 	FullSchemas bool
 }
 
-// Frontend is a Game Forge MCP server bound to one daemon client and one
-// project cwd.
+// Dispatcher is how a frontend reaches the Operation Registry/Core without
+// owning resources itself. The daemon's in-process dispatcher (canonical /mcp
+// endpoint) and the daemon HTTP client (stdio compatibility) both satisfy it.
+type Dispatcher interface {
+	// Catalog returns the protocol identity and every operation's canonical
+	// contract — one call, regardless of how many operations exist.
+	Catalog(ctx context.Context) (protocol string, version int, ops []op.Meta, err error)
+	// Run executes one canonical request envelope. req.Project carries the
+	// registered project code; the daemon resolves it to a root.
+	Run(ctx context.Context, req *op.Request, sink op.Sink) (any, *op.Error)
+	// Requests returns daemon HTTP round trips made so far — an in-process
+	// dispatcher reports 0. Audits gate init round trips through it.
+	Requests() int64
+}
+
+// Frontend is one MCP server bound to one dispatcher.
 type Frontend struct {
-	cl  *client.Client
-	srv *mcp.Server
-	opt Options
-	// ops maps an MCP tool name to its canonical operation name.
-	ops map[string]string
-	// metas records the canonical op metadata each tool was built from, for
-	// diagnostics and tests.
-	metas map[string]*client.OpSchema
+	disp  Dispatcher
+	srv   *mcp.Server
+	opt   Options
+	ops   map[string]string
+	metas map[string]*op.Meta
 }
 
-// New connects to the daemon, verifies protocol compatibility, discovers the
-// canonical operation catalog and registers one MCP tool per operation. cwd is
-// the project context forwarded in every request envelope.
-func New(ctx context.Context, cl *client.Client, cwd string) (*Frontend, error) {
-	return NewWithOptions(ctx, cl, cwd, Options{})
-}
-
-// NewWithOptions is New with explicit compatibility options.
-func NewWithOptions(ctx context.Context, cl *client.Client, cwd string, opt Options) (*Frontend, error) {
-	if cl == nil {
-		return nil, fmt.Errorf("game-forged client is required")
-	}
-	cl = cl.WithCwd(cwd)
-	// ONE catalog request carries both the compatibility identity and every
-	// operation's contract — initialization cost does not grow with tool
-	// count. This request is metadata-only: it never starts a browser, a dev
-	// server or a GPU probe.
-	cat, err := cl.Catalog(ctx)
+// New builds an MCP server whose tools are derived entirely from the
+// dispatcher's operation catalog: the advertised input schemas are exactly
+// the canonical ones (plus the transport-level project_code), and every call
+// is validated by the daemon against the same schemas.
+func New(ctx context.Context, disp Dispatcher, opt Options) (*Frontend, error) {
+	proto, ver, metas, err := disp.Catalog(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("discover operations: %w", err)
+		return nil, fmt.Errorf("catalog: %w", err)
 	}
-	if cat.Protocol != daemon.Protocol || cat.V != schemas.Version {
-		return nil, fmt.Errorf("incompatible game-forged (protocol %q v%d; want %q v%d) — run: game-forge daemon restart",
-			cat.Protocol, cat.V, daemon.Protocol, schemas.Version)
+	if proto != schemas.Protocol || ver != schemas.Version {
+		return nil, fmt.Errorf("dispatcher speaks %s v%d, expected %s v%d",
+			proto, ver, schemas.Protocol, schemas.Version)
 	}
-	srv := mcp.NewServer(&mcp.Implementation{Name: "game-forge", Version: Version}, nil)
-	f := &Frontend{cl: cl, srv: srv, opt: opt, ops: map[string]string{}, metas: map[string]*client.OpSchema{}}
-	for i := range cat.Ops {
-		meta := &cat.Ops[i]
-		if err := f.add(meta.Op, meta); err != nil {
+	srv := mcp.NewServer(&mcp.Implementation{
+		Name:    "game-forge",
+		Version: Version,
+	}, nil)
+	f := &Frontend{disp: disp, srv: srv, opt: opt, ops: map[string]string{}, metas: map[string]*op.Meta{}}
+	for i := range metas {
+		if err := f.add(metas[i].Op, &metas[i]); err != nil {
 			return nil, err
 		}
 	}
 	return f, nil
 }
 
-// toolName maps a canonical operation name to an MCP tool name. Dots become
-// underscores (tool names must match [a-zA-Z0-9_-]{1,64}); the mapping is
-// deterministic and one-to-one for the registered operations.
+// Server returns the underlying MCP server (for streamable-HTTP mounting).
+func (f *Frontend) Server() *mcp.Server { return f.srv }
+
+// HTTPHandler mounts the MCP server as a Streamable HTTP handler — the
+// daemon's canonical /mcp endpoint. The daemon injects it at startup so the
+// transport lives inside its one listener and MCP calls share the daemon's
+// in-process dispatcher (no HTTP loop into itself).
+func HTTPHandler(disp Dispatcher, opt Options) (http.Handler, error) {
+	fe, err := New(context.Background(), disp, opt)
+	if err != nil {
+		return nil, err
+	}
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		return fe.Server()
+	}, nil), nil
+}
+
+// Run serves MCP over the given transport until it closes.
+func (f *Frontend) Run(ctx context.Context, t mcp.Transport) error {
+	return f.srv.Run(ctx, t)
+}
+
+// OpName reports the canonical operation behind a tool name, for diagnostics.
+func (f *Frontend) OpName(tool string) string { return f.ops[tool] }
+
+// toolName maps a canonical op name to an MCP tool name. Dots are not
+// allowed in tool names; the mapping is deterministic and collisions are a
+// build error, so a future "scenario_run"-style op name cannot shadow
+// "scenario.run".
 func toolName(opName string) string {
 	return strings.ReplaceAll(opName, ".", "_")
 }
 
-// add registers one operation as an MCP tool. Tool schemas are a deterministic
-// compact projection of the canonical contract — never a second handwritten
-// schema — so the exposed contract cannot drift from what the daemon
-// validates and executes.
-func (f *Frontend) add(opName string, meta *client.OpSchema) error {
-	tn := toolName(opName)
-	if prev, dup := f.ops[tn]; dup {
-		return fmt.Errorf("tool name collision: %q and %q both map to %q", prev, opName, tn)
+// add registers one operation as an MCP tool. The tool's input schema is the
+// compact projection of the canonical input schema plus project_code, and
+// optionally the canonical output schema.
+func (f *Frontend) add(opName string, meta *op.Meta) error {
+	name := toolName(opName)
+	if _, dup := f.ops[name]; dup {
+		return fmt.Errorf("tool name collision for operation %q", opName)
 	}
-	in := compactSchema(meta.Input)
-	if !isObjectSchema(in) {
-		return fmt.Errorf("operation %s: input schema is not an object schema", opName)
+	desc := meta.Summary
+	if desc == "" {
+		desc = opName
 	}
+	in := injectProjectCode(compactSchema(meta.Input))
 	t := &mcp.Tool{
-		Name:        tn,
-		Description: meta.Summary,
-		InputSchema: json.RawMessage(in),
+		Name:        name,
+		Description: desc,
+		InputSchema: in,
 	}
 	if f.opt.FullSchemas {
-		if out := compactSchema(meta.Output); isObjectSchema(out) {
-			t.OutputSchema = json.RawMessage(out)
-		}
+		t.OutputSchema = compactSchema(meta.Output)
 	}
-	f.ops[tn] = opName
+	f.srv.AddTool(t, f.call)
+	f.ops[name] = opName
 	f.metas[opName] = meta
-	f.srv.AddTool(t, f.call(opName))
 	return nil
 }
 
-// compactSchema derives the MCP-advertised schema from the canonical one by
-// dropping metadata that carries no validation semantics: "$schema" (draft
-// marker) and "$id" (document URI). All other keys — type, required,
-// properties, enum, bounds, additionalProperties, property descriptions — are
-// preserved verbatim because they either constrain arguments or help an agent
-// choose values. If a schema ever grows "$ref" anchors the projection is
-// disabled for that document, since $id then participates in resolution.
-func compactSchema(raw json.RawMessage) json.RawMessage {
-	var doc any
-	if json.Unmarshal(raw, &doc) != nil {
-		return raw
+// projectCodeSchema is the MCP-only transport property injected into every
+// tool. Compact by contract: the registry validates the code semantically, so
+// the wire only needs the type.
+var projectCodeSchema = map[string]any{"type": "string"}
+
+// injectProjectCode adds the required transport-level project_code property
+// to a compact input schema. Canonical operation schemas stay untouched —
+// project selection is request context, not operation semantics.
+func injectProjectCode(in json.RawMessage) json.RawMessage {
+	var doc map[string]any
+	if err := json.Unmarshal(in, &doc); err != nil || doc == nil {
+		return in
 	}
-	if containsRef(doc) {
-		return raw
+	props, _ := doc["properties"].(map[string]any)
+	if props == nil {
+		props = map[string]any{}
+		doc["properties"] = props
 	}
-	stripMeta(doc)
+	props["project_code"] = projectCodeSchema
+	req, _ := doc["required"].([]any)
+	seen := false
+	for _, r := range req {
+		if r == "project_code" {
+			seen = true
+		}
+	}
+	if !seen {
+		doc["required"] = append(req, "project_code")
+	}
 	out, err := json.Marshal(doc)
 	if err != nil {
-		return raw
+		return in
 	}
 	return out
 }
 
-// containsRef reports whether a "$ref" key appears anywhere in the document.
-func containsRef(v any) bool {
-	m, ok := v.(map[string]any)
+// progressSink forwards semantic progress as MCP progress notifications. Only
+// stage/artifact transitions are forwarded — raw logs never leave the daemon.
+// Consecutive identical messages are suppressed and messages are capped, so
+// progress carries semantic state changes only.
+type progressSink struct {
+	send func(msg string)
+	last atomic.Value
+}
+
+// Stage maps a stage transition to one compact progress message.
+func (p *progressSink) Stage(name, status string, _ int64, detail string) {
+	msg := name + " " + status
+	if detail != "" {
+		msg += " " + detail
+	}
+	p.send(msg)
+}
+
+// Artifact maps an artifact event to a compact reference, never its bytes.
+func (p *progressSink) Artifact(kind, ref, _ string) {
+	p.send(kind + " " + ref)
+}
+
+func (p *progressSink) emit(ctx context.Context, req *mcp.CallToolRequest, msg string) {
+	if len(msg) > maxProgressText {
+		msg = msg[:maxProgressText]
+	}
+	if prev, ok := p.last.Load().(string); ok && prev == msg {
+		return // repeated identical progress adds no information
+	}
+	p.last.Store(msg)
+	_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{Message: msg})
+}
+
+// call executes one tool call. It extracts the transport-level project_code,
+// forwards canonical args to the dispatcher, and returns structuredContent —
+// the canonical result JSON — with no duplicated text by default.
+func (f *Frontend) call(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	opName, ok := f.ops[req.Params.Name]
 	if !ok {
-		if list, isList := v.([]any); isList {
-			for _, e := range list {
-				if containsRef(e) {
-					return true
-				}
+		return nil, fmt.Errorf("unknown tool %q", req.Params.Name)
+	}
+	var args map[string]json.RawMessage
+	if len(req.Params.Arguments) > 0 {
+		if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
+			return f.errResult(&op.Error{Code: op.CodeInvalidArgs, Path: "/", Msg: "arguments are not valid JSON"}), nil
+		}
+	}
+	code, err := takeProjectCode(args)
+	if err != nil {
+		return f.errResult(err), nil
+	}
+	canonical, _ := json.Marshal(args)
+	p := &progressSink{}
+	p.send = func(msg string) { p.emit(ctx, req, msg) }
+	data, werr := f.disp.Run(ctx, &op.Request{
+		V: schemas.Version, Op: opName, Args: canonical, Project: code,
+	}, p)
+	if werr != nil {
+		return f.errResult(werr), nil
+	}
+	res := &mcp.CallToolResult{Content: []mcp.Content{}}
+	if data != nil {
+		raw, _ := json.Marshal(data)
+		res.StructuredContent = json.RawMessage(raw)
+		if f.opt.CompatText {
+			res.Content = []mcp.Content{&mcp.TextContent{Text: string(raw)}}
+		}
+	}
+	return res, nil
+}
+
+// takeProjectCode removes project_code from args and returns it. It is
+// required on every tool: explicit per-call routing is what lets concurrent
+// calls for different projects share one MCP service safely.
+func takeProjectCode(args map[string]json.RawMessage) (string, *op.Error) {
+	raw, ok := args["project_code"]
+	if !ok {
+		return "", &op.Error{Code: op.CodeInvalidArgs, Path: "/project_code", Msg: "project_code is required"}
+	}
+	delete(args, "project_code")
+	var code string
+	if err := json.Unmarshal(raw, &code); err != nil || code == "" {
+		return "", &op.Error{Code: op.CodeInvalidArgs, Path: "/project_code", Msg: "project_code must be a non-empty string"}
+	}
+	return code, nil
+}
+
+// errText renders a canonical wire error as compact MCP text: stable code,
+// concise message, argument path — hard-capped and free of internals.
+func errText(e *op.Error) string {
+	text := e.Code + ": " + e.Msg
+	if e.Path != "" {
+		text += " (" + e.Path + ")"
+	}
+	if len(text) > maxErrorText {
+		text = text[:maxErrorText]
+	}
+	return text
+}
+
+// errResult renders a canonical wire error as an MCP error result.
+func (f *Frontend) errResult(e *op.Error) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: errText(e)}},
+	}
+}
+
+// compactSchema projects a canonical schema onto the MCP wire: the document
+// minus $schema/$id metadata, which is authoring/reference metadata the model
+// never needs and which carries no validation semantics. Documents containing
+// $ref are returned untouched — $id participates in reference resolution, so
+// stripping it could break a schema.
+func compactSchema(in json.RawMessage) json.RawMessage {
+	var doc map[string]any
+	if err := json.Unmarshal(in, &doc); err != nil || doc == nil {
+		return in
+	}
+	if hasRef(doc) {
+		return in
+	}
+	stripMeta(doc)
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return in
+	}
+	return out
+}
+
+// hasRef reports whether the schema tree uses $ref anywhere.
+func hasRef(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, sub := range t {
+			if k == "$ref" {
+				return true
+			}
+			if hasRef(sub) {
+				return true
 			}
 		}
-		return false
-	}
-	if _, has := m["$ref"]; has {
-		return true
-	}
-	for _, e := range m {
-		if containsRef(e) {
-			return true
+	case []any:
+		for _, sub := range t {
+			if hasRef(sub) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// stripMeta removes wire-irrelevant schema metadata recursively.
+// stripMeta removes $schema/$id keys recursively.
 func stripMeta(v any) {
-	m, ok := v.(map[string]any)
-	if !ok {
-		if list, isList := v.([]any); isList {
-			for _, e := range list {
-				stripMeta(e)
-			}
+	switch t := v.(type) {
+	case map[string]any:
+		delete(t, "$schema")
+		delete(t, "$id")
+		for _, sub := range t {
+			stripMeta(sub)
 		}
-		return
-	}
-	delete(m, "$schema")
-	delete(m, "$id")
-	for _, e := range m {
-		stripMeta(e)
-	}
-}
-
-// isObjectSchema reports whether a raw JSON Schema has "type":"object".
-// MCP requires tool input/output schemas to be objects.
-func isObjectSchema(raw json.RawMessage) bool {
-	var v struct {
-		Type string `json:"type"`
-	}
-	return json.Unmarshal(raw, &v) == nil && v.Type == "object"
-}
-
-// OpName returns the canonical operation behind an MCP tool name, for
-// diagnostics.
-func (f *Frontend) OpName(tool string) string { return f.ops[tool] }
-
-// Run serves the frontend over transport t until it ends or ctx is canceled.
-func (f *Frontend) Run(ctx context.Context, t mcp.Transport) error {
-	return f.srv.Run(ctx, t)
-}
-
-// call builds the MCP handler for one canonical operation. A tool call becomes
-// a Game Forge request envelope and is executed through the daemon client —
-// never a shell command, never a second Core.
-func (f *Frontend) call(opName string) mcp.ToolHandler {
-	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		var token any
-		if req.Params != nil {
-			token = req.Params.GetProgressToken()
+	case []any:
+		for _, sub := range t {
+			stripMeta(sub)
 		}
-		var stage int
-		var lastMsg string
-		// Semantic progress only: Game Forge stage/artifact events become MCP
-		// progress notifications when the client supplied a progress token.
-		// Raw subprocess logs are never forwarded, and a repeated identical
-		// message is suppressed rather than re-emitted.
-		onEvent := func(ev op.Event) {
-			if token == nil || req.Session == nil {
-				return
-			}
-			var msg string
-			switch ev.Ev {
-			case op.EvStage:
-				stage++
-				msg = ev.Name + " " + ev.Status
-				if s, _ := ev.Data.(string); s != "" {
-					msg += " " + s
-				}
-			case op.EvArtifact:
-				msg = "artifact " + ev.Kind + " " + ev.Path
-			default:
-				return
-			}
-			if msg == lastMsg {
-				return
-			}
-			lastMsg = msg
-			if len(msg) > maxProgressText {
-				msg = msg[:maxProgressText]
-			}
-			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
-				ProgressToken: token,
-				Progress:      float64(stage),
-				Message:       msg,
-			})
-		}
-
-		var args json.RawMessage
-		if req.Params != nil && len(req.Params.Arguments) > 0 {
-			args = req.Params.Arguments
-		}
-		// Streaming is used for every call so stage/artifact events flow into
-		// progress; the operation's canonical result is the done event's data.
-		// ctx cancellation propagates to the daemon request, canceling the Core
-		// operation without touching reusable daemon-owned resources.
-		data, werr := f.cl.Stream(ctx, opName, args, onEvent)
-		if werr != nil {
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{Text: errText(werr)}},
-			}, nil
-		}
-		res := &mcp.CallToolResult{Content: []mcp.Content{}}
-		if len(data) > 0 && string(data) != "null" {
-			// The canonical structured result is authoritative. Compact mode
-			// emits no mirrored text: a standards-valid empty content array
-			// costs nothing in context. Compat mode mirrors the JSON for
-			// clients that predate structuredContent.
-			res.StructuredContent = json.RawMessage(data)
-			if f.opt.CompatText {
-				res.Content = []mcp.Content{&mcp.TextContent{Text: string(data)}}
-			}
-		}
-		return res, nil
 	}
-}
-
-// errText renders a canonical Game Forge error concisely: code, message and
-// the arg path when the failure is argument-shaped. It is hard-capped so a
-// giant embedded message cannot flood context. Tokens and internal auth
-// details are never included.
-func errText(e *op.Error) string {
-	s := e.Code + ": " + e.Msg
-	if e.Path != "" {
-		s += " (" + e.Path + ")"
-	}
-	if len(s) > maxErrorText {
-		s = s[:maxErrorText-3] + "..."
-	}
-	return s
 }

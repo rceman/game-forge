@@ -20,14 +20,16 @@ import (
 
 	"github.com/rceman/game-forge/internal/core"
 	"github.com/rceman/game-forge/internal/op"
+	"github.com/rceman/game-forge/internal/project"
 	"github.com/rceman/game-forge/schemas"
 )
 
 // HousekeepingInterval is the cadence of the in-process housekeeping loop.
 const HousekeepingInterval = 15 * time.Second
 
-// Server is the control daemon. It serves the Operation Registry over
-// loopback HTTP and owns the housekeeping loop.
+// Server is the control daemon. It serves the Operation Registry and the MCP
+// endpoint over one loopback HTTP listener on the durable daemon port, and
+// owns the housekeeping loop.
 type Server struct {
 	rt          *core.Runtime
 	reg         *op.Registry
@@ -39,6 +41,19 @@ type Server struct {
 	incarnation string
 	runSeq      atomic.Int64
 	serveFn     func(ln net.Listener, h http.Handler) error
+
+	// projects is the durable machine-local project registry. Resolution is
+	// read-on-request so CLI registration is visible without restart.
+	projects *project.Registry
+	projErr  error
+	// mcpTok is the durable MCP credential for /mcp (distinct from the
+	// ephemeral per-incarnation daemon token above).
+	mcpTok string
+	mcpErr error
+	// mcpH is the streamable-HTTP MCP handler, injected at startup by the
+	// caller that wires the frontend (cli's daemon serve) — the daemon
+	// package itself stays free of the frontend, avoiding an import cycle.
+	mcpH http.Handler
 }
 
 // NewServer builds a daemon around a Runtime and registry.
@@ -47,6 +62,8 @@ func NewServer(rt *core.Runtime, reg *op.Registry, logger *log.Logger) *Server {
 		logger = log.New(io.Discard, "", 0)
 	}
 	tok, _ := newToken()
+	proj, perr := project.OpenRegistry()
+	mcpTok, mcpErr := DurableMCPToken()
 	return &Server{
 		rt:          rt,
 		reg:         reg,
@@ -55,6 +72,10 @@ func NewServer(rt *core.Runtime, reg *op.Registry, logger *log.Logger) *Server {
 		done:        make(chan struct{}),
 		stopCh:      make(chan struct{}),
 		incarnation: newIncarnation(),
+		projects:    proj,
+		projErr:     perr,
+		mcpTok:      mcpTok,
+		mcpErr:      mcpErr,
 	}
 }
 
@@ -111,7 +132,7 @@ func acquireLifetimeLock() (func(), error) {
 	return nil, fmt.Errorf("could not claim daemon ownership")
 }
 
-// Serve binds a dynamic loopback port, writes discovery state, runs startup
+// Serve binds the durable loopback port, writes discovery state, runs startup
 // reconciliation and the housekeeping loop, and serves until stopped.
 func (s *Server) Serve() error {
 	// Only one daemon incarnation may own discovery/control at once. The
@@ -130,9 +151,13 @@ func (s *Server) Serve() error {
 		s.token = tok
 	}
 	tok := s.token
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// The listener binds the durable port: first start picks an available
+	// 50000-59999 port and persists it; restarts rebind the exact same port so
+	// a configured MCP endpoint stays valid. An occupied persisted port is a
+	// clear failure resolved by `daemon rebind`, never a silent move.
+	ln, _, err := bindEndpoint()
 	if err != nil {
-		return fmt.Errorf("bind daemon: %w", err)
+		return err
 	}
 	disc := &Discovery{
 		Protocol: Protocol,
@@ -274,7 +299,9 @@ func (s *Server) Token() string { return s.token }
 // tests and frontends can serve the same routes without binding a listener.
 func (s *Server) Handler() http.Handler { return s.routes() }
 
-// routes returns the authenticated HTTP mux.
+// routes returns the authenticated HTTP mux. /mcp uses the separate durable
+// MCP credential, not the ephemeral daemon token — the two auth domains never
+// substitute for one another.
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.auth(s.handleHealth))
@@ -283,6 +310,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/v1/schema/", s.auth(s.handleSchema))
 	mux.HandleFunc("/v1/run", s.auth(s.handleRun))
 	mux.HandleFunc("/v1/shutdown", s.auth(s.handleShutdown))
+	mux.Handle("/mcp", s.mcpAuth(s.mcpHandler()))
 	return mux
 }
 
@@ -297,6 +325,78 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// mcpAuth enforces the durable MCP credential on /mcp and rejects browser
+// requests whose Origin is not local. Token bytes never appear in replies.
+func (s *Server) mcpAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !localOrigin(r.Header.Get("Origin")) {
+			writeErr(w, http.StatusForbidden, &op.Error{Code: "forbidden", Msg: "non-local Origin rejected"})
+			return
+		}
+		h := r.Header.Get("Authorization")
+		if s.mcpErr != nil || s.mcpTok == "" ||
+			!strings.HasPrefix(h, "Bearer ") || h[len("Bearer "):] != s.mcpTok {
+			writeErr(w, http.StatusUnauthorized, &op.Error{Code: "unauthorized", Msg: "missing or invalid MCP credential"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// MCPToken returns the durable MCP credential. The endpoint advertises it
+// only through explicit commands like `mcp info --show-token`.
+func (s *Server) MCPToken() string { return s.mcpTok }
+
+// SetMCP mounts the streamable-HTTP MCP handler. The frontend is built by the
+// caller (the daemon's own serve command) around this server as dispatcher, so
+// MCP calls execute the same canonical pipeline as /v1/run with no HTTP loop
+// into the daemon itself.
+func (s *Server) SetMCP(h http.Handler) { s.mcpH = h }
+
+// mcpHandler returns the mounted MCP handler, or a clear 503 when the daemon
+// was built without one (tests that only exercise the control API).
+func (s *Server) mcpHandler() http.Handler {
+	if s.mcpH == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeErr(w, http.StatusServiceUnavailable, &op.Error{Code: op.CodeInternal, Msg: "MCP frontend not mounted"})
+		})
+	}
+	return s.mcpH
+}
+
+// Catalog returns the in-process operation catalog — it satisfies the MCP
+// frontend's dispatcher contract without this package importing it.
+func (s *Server) Catalog(_ context.Context) (string, int, []op.Meta, error) {
+	ops := make([]op.Meta, 0, s.reg.Len())
+	for _, o := range s.reg.All() {
+		ops = append(ops, op.Meta{
+			Op:      o.Name,
+			Summary: o.Summary,
+			Stream:  o.Stream,
+			Input:   o.InputSchema(),
+			Output:  o.OutputSchema(),
+		})
+	}
+	return Protocol, schemas.Version, ops, nil
+}
+
+// Run is the in-process dispatch path for MCP calls — it satisfies the MCP
+// frontend's dispatcher contract and shares /v1/run's prepare+exec pipeline:
+// same project resolution, validation, run ids, cancellation, progress and
+// output checks.
+func (s *Server) Run(ctx context.Context, req *op.Request, sink op.Sink) (any, *op.Error) {
+	o, perr := s.prepare(req)
+	if perr != nil {
+		return nil, perr
+	}
+	ctx = op.WithRunID(op.WithCwd(ctx, req.Cwd), s.nextID("r"))
+	return s.exec(ctx, req, o, sink)
+}
+
+// Requests satisfies the dispatcher contract's audit hook: in-process
+// dispatch makes no HTTP round trips.
+func (s *Server) Requests() int64 { return 0 }
 
 // handleHealth reports liveness.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -395,13 +495,9 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, &op.Error{Code: op.CodeUnsupported, Msg: fmt.Sprintf("unsupported version %d", req.V)})
 		return
 	}
-	o, ok := s.reg.Lookup(req.Op)
-	if !ok {
-		writeErr(w, http.StatusNotFound, &op.Error{Code: op.CodeUnknownOp, Msg: "unknown operation " + req.Op})
-		return
-	}
-	if verr := o.ValidateArgs(req.Args); verr != nil {
-		writeErr(w, http.StatusBadRequest, verr)
+	o, perr := s.prepare(&req)
+	if perr != nil {
+		writeErr(w, statusForErr(perr), perr)
 		return
 	}
 	// A request id is never ambiguously empty: when the client omits one, the
@@ -422,24 +518,69 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	s.simpleRun(w, op.WithRunID(ctx, s.nextID("r")), req, o)
 }
 
+// prepare resolves the request's project selector and validates args. It is
+// the shared front half of dispatch used by /v1/run and the in-process MCP
+// dispatcher: a "project" code resolves against the durable registry to the
+// registered canonical root; exactly one of project/cwd may select context.
+func (s *Server) prepare(req *op.Request) (*op.Operation, *op.Error) {
+	o, ok := s.reg.Lookup(req.Op)
+	if !ok {
+		return nil, &op.Error{Code: op.CodeUnknownOp, Msg: "unknown operation " + req.Op}
+	}
+	if req.Project != "" {
+		if req.Cwd != "" {
+			return nil, &op.Error{Code: op.CodeInvalidRequest, Msg: "specify project or cwd, not both"}
+		}
+		if s.projErr != nil {
+			return nil, &op.Error{Code: op.CodeInternal, Msg: "project registry: " + s.projErr.Error()}
+		}
+		root, lerr := s.projects.Resolve(req.Project)
+		if lerr != nil {
+			return nil, &op.Error{Code: lerr.Code, Msg: lerr.Msg}
+		}
+		req.Cwd = root
+		req.Project = ""
+	}
+	if verr := o.ValidateArgs(req.Args); verr != nil {
+		return nil, verr
+	}
+	return o, nil
+}
+
+// exec invokes the handler and validates its output — the shared back half of
+// dispatch. A handler may return data and a failure together: the output is
+// meaningful but asserts a failure; both are reported.
+func (s *Server) exec(ctx context.Context, req *op.Request, o *op.Operation, sink op.Sink) (any, *op.Error) {
+	data, err := o.Handler(ctx, req.Args, sink)
+	var werr *op.Error
+	if data != nil {
+		if verr := o.ValidateOutput(data); verr != nil {
+			data = nil
+			werr = verr
+		}
+	}
+	if err != nil && werr == nil {
+		werr = toWireErr(err)
+	}
+	return data, werr
+}
+
+// statusForErr maps a pre-dispatch error to an HTTP status.
+func statusForErr(e *op.Error) int {
+	switch e.Code {
+	case op.CodeUnknownOp:
+		return http.StatusNotFound
+	}
+	return http.StatusBadRequest
+}
+
 // simpleRun executes an operation and returns one compact reply.
 //
 // A handler may return a result and a failure together: the operation ran, its
 // output is meaningful, but it asserts a failure. Both are sent.
 func (s *Server) simpleRun(w http.ResponseWriter, ctx context.Context, req op.Request, o *op.Operation) {
-	data, err := o.Handler(ctx, req.Args, op.NopSink{})
-	resp := op.Response{ID: req.ID, OK: err == nil}
-	if data != nil {
-		if verr := o.ValidateOutput(data); verr != nil {
-			resp.OK = false
-			resp.Err = verr
-		} else {
-			resp.Data = data
-		}
-	}
-	if err != nil && resp.Err == nil {
-		resp.Err = toWireErr(err)
-	}
+	data, werr := s.exec(ctx, &req, o, op.NopSink{})
+	resp := op.Response{ID: req.ID, OK: werr == nil, Data: data, Err: werr}
 	if verr := op.ValidateResponse(resp); verr != nil {
 		resp = op.Response{ID: req.ID, Err: &op.Error{Code: op.CodeInternal, Msg: "invalid response"}}
 	}
@@ -469,19 +610,10 @@ func (s *Server) streamRun(w http.ResponseWriter, ctx context.Context, req op.Re
 	}
 	sink := &eventSink{emit: emit, run: runID}
 	emit(op.Event{Ev: op.EvStart, Run: runID})
-	data, err := o.Handler(op.WithRunID(ctx, runID), req.Args, sink)
-	done := op.Event{Ev: op.EvDone, Run: runID}
+	data, werr := s.exec(op.WithRunID(ctx, runID), &req, o, sink)
+	done := op.Event{Ev: op.EvDone, Run: runID, Data: data, Err: werr}
 	code := 0
-	if data != nil {
-		if verr := o.ValidateOutput(data); verr != nil {
-			done.Err = verr
-			code = 1
-		} else {
-			done.Data = data
-		}
-	}
-	if err != nil && done.Err == nil {
-		done.Err = toWireErr(err)
+	if werr != nil {
 		code = 1
 	}
 	if code != 0 {

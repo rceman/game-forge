@@ -10,6 +10,7 @@ import (
 	"github.com/rceman/game-forge/internal/client"
 	"github.com/rceman/game-forge/internal/core"
 	"github.com/rceman/game-forge/internal/daemon"
+	"github.com/rceman/game-forge/internal/mcpfrontend"
 	"github.com/rceman/game-forge/internal/op"
 )
 
@@ -28,8 +29,10 @@ func cmdDaemon(args []string) int {
 		return daemonStop()
 	case "restart":
 		return daemonRestart()
+	case "rebind":
+		return daemonRebind()
 	default:
-		fmt.Fprintln(os.Stderr, "game-forge daemon: expected subcommand (start|status|stop|restart)")
+		fmt.Fprintln(os.Stderr, "game-forge daemon: expected subcommand (start|status|stop|restart|rebind)")
 		return ExitUsage
 	}
 }
@@ -61,6 +64,17 @@ func daemonServe() int {
 		}
 	}
 	srv := daemon.NewServer(rt, reg, logger)
+	// Mount the canonical MCP endpoint on the daemon's one listener. The
+	// frontend shares this server's in-process dispatcher — /mcp calls run
+	// the same pipeline as /v1/run, and the daemon package stays free of the
+	// frontend (no import cycle).
+	mcpfrontend.Version = Version
+	mcpH, err := mcpfrontend.HTTPHandler(srv, mcpfrontend.Options{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "game-forged: mount MCP: %v\n", err)
+		return ExitFail
+	}
+	srv.SetMCP(mcpH)
 	if err := srv.Serve(); err != nil {
 		fmt.Fprintf(os.Stderr, "game-forged: %v\n", err)
 		return ExitFail
@@ -93,7 +107,34 @@ func daemonStatus() int {
 	}
 	d := cl.Discovery()
 	ops, _ := cl.Capabilities(ctx)
-	fmt.Printf("game-forged running\n  endpoint: %s\n  pid:      %d\n  ops:      %d\n", d.Endpoint, d.PID, len(ops))
+	fmt.Printf("game-forged running\n  endpoint: %s\n  pid:      %d\n  ops:      %d\n  mcp:      %s/mcp\n", d.Endpoint, d.PID, len(ops), d.Endpoint)
+	return ExitOK
+}
+
+// daemonRebind is the explicit recovery for an occupied durable port: stop
+// the daemon, drop the persisted port, and start fresh on a newly chosen one.
+// MCP client configuration must then use the new endpoint — the port never
+// moves silently.
+func daemonRebind() int {
+	if client.Connect(context.Background()) != nil {
+		if code := daemonStop(); code != ExitOK {
+			return code
+		}
+	}
+	if err := daemon.ClearEndpoint(); err != nil {
+		fmt.Fprintf(os.Stderr, "game-forge daemon rebind: %v\n", err)
+		return ExitFail
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	cl, err := client.Ensure(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "game-forge daemon rebind: %v\n", err)
+		return ExitFail
+	}
+	d := cl.Discovery()
+	fmt.Printf("game-forged rebound\n  endpoint: %s\n  mcp:      %s/mcp\n", d.Endpoint, d.Endpoint)
+	fmt.Println("  update MCP client configuration to the new endpoint")
 	return ExitOK
 }
 

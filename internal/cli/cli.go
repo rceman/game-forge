@@ -44,6 +44,15 @@ func Run(args []string) int {
 		return cmdDaemon(args[1:])
 	case "mcp":
 		return cmdMCP(args[1:])
+	case "project":
+		// The registry subcommands are local machine state; "project info"
+		// remains the daemon operation.
+		if len(args) > 1 {
+			switch args[1] {
+			case "add", "list", "show", "remove":
+				return cmdRegistry(args[1:])
+			}
+		}
 	}
 	c, code, done := dispatch(args)
 	if done {
@@ -159,6 +168,8 @@ the raw event stream.
 
 Project:
   project info                 Show the nearest project manifest
+  project add <code>           Register the current project under a stable code
+  project list|show|remove     Manage the machine-local project registry
   scenario list                List the project's scenarios
   scenario describe <id>       Describe one scenario
   scenario run <id>            Run a scenario headlessly (--browser for the browser)
@@ -185,9 +196,11 @@ Daemon:
   daemon status                Show the running daemon
   daemon stop                  Stop the daemon gracefully
   daemon restart               Restart the daemon
+  daemon rebind                Pick a new durable port (MCP endpoint changes)
 
 MCP:
-  mcp serve [--cwd DIR]        Serve MCP over stdio (for MCP-capable agents)
+  mcp info [--json] [--show-token]  Show the canonical MCP endpoint
+  mcp serve                  Serve MCP over stdio (compatibility frontend)
   mcp audit [--json]           Measure the MCP efficiency surface vs budget
 
 Other:

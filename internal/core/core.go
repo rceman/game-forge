@@ -12,12 +12,10 @@ package core
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -236,21 +234,7 @@ func (c *Core) projectKey() (string, error) {
 
 // projectKeyFor derives the project key from a manifest.
 func projectKeyFor(m *project.Manifest) string {
-	root := canonicalRoot(m.Root)
-	sum := sha256.Sum256([]byte(root))
-	return fmt.Sprintf("%s-%x", sanitize(m.Project.ID), sum[:3])
-}
-
-// canonicalRoot resolves symlinks and absolutizes a project root so the same
-// checkout always hashes identically.
-func canonicalRoot(root string) string {
-	if p, err := filepath.EvalSymlinks(root); err == nil {
-		root = p
-	}
-	if p, err := filepath.Abs(root); err == nil {
-		root = p
-	}
-	return filepath.Clean(root)
+	return project.KeyFor(m)
 }
 
 // ownsResource reports whether a registry record belongs to this project.
@@ -278,23 +262,6 @@ func (c *Core) sharedNamespace() (string, error) {
 		id += "-unmuted"
 	}
 	return c.namespaceFor(id), nil
-}
-
-// sanitize reduces a project id to characters safe for a provider namespace.
-func sanitize(s string) string {
-	var b strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('-')
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		out = "project"
-	}
-	return out
 }
 
 // adapter returns a running simulation adapter and its cleanup.
