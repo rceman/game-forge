@@ -1,0 +1,30 @@
+{
+  "$comment": "MCP efficiency contract. Named hard limits for the agent-facing wire surface; tests and `game-forge mcp audit` fail when exceeded. Never auto-rebaselined: raising a limit is a deliberate source change that must be justified in the commit message. Baseline (19 tools): catalog 5084 B, model surface 4237 B, largest tool 486 B, avg 266 B — limits carry ~20% headroom plus room for catalog growth.",
+  "maxCatalogBytes": 6144,
+  "maxModelSurfaceBytes": 5120,
+  "maxDescriptionBytesPerTool": 120,
+  "maxToolBytes": 640,
+  "maxAvgToolBytes": 320,
+  "maxInitHTTPRequests": 2,
+  "maxWarmInitMs": 500,
+  "maxWarmReadyMs": 500,
+  "maxStructuredTextDuplicateBytes": 0,
+  "maxSuccessTextBytes": 256,
+  "maxErrorTextBytes": 512,
+  "maxDuplicateProgressEvents": 0,
+  "maxResultBytes": 4096,
+  "maxTrivialCallMs": 100,
+  "targetWarmInitMs": 150,
+  "targetTrivialCallMs": 25,
+  "representativeResultBytes": {
+    "project_info": 400,
+    "scenario_list": 448,
+    "scenario_run": 448,
+    "scenario_compare": 464,
+    "visual_shot": 192,
+    "browser_errors": 128,
+    "resource_list": 704,
+    "gpu_run": 320,
+    "profile_run": 576
+  }
+}

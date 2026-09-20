@@ -509,12 +509,14 @@ MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
   other command. The MCP process never creates a second resource-owning
   Runtime: browsers, dev servers, leases and `ps`/`gc`/`tick` stay owned by the
   per-user daemon.
-- On startup it verifies daemon protocol compatibility (a mismatched daemon
-  fails clearly — `game-forge daemon restart`), then discovers the catalog via
-  `GET /v1/capabilities` + `GET /v1/schema/<op>`. Tool names, descriptions and
-  input/output JSON Schemas come verbatim from the Operation Registry, so the
-  tools always describe the contract the daemon actually validates and
-  executes.
+- On startup it verifies daemon protocol compatibility and discovers the
+  whole catalog in ONE request — `GET /v1/catalog` carries `{v, protocol,
+  ops:[{op, summary, stream, input, output}]}`. Initialization cost never
+  grows with tool count (a 100-tool Game Forge still takes one catalog
+  request); a catalog-less or protocol-mismatched daemon fails clearly
+  (`game-forge daemon restart`). Tool names, descriptions and schemas derive
+  from the Operation Registry, so the tools always describe the contract the
+  daemon actually validates and executes.
 - Operation `scenario.run` becomes tool `scenario_run` — dots map to
   underscores deterministically and collisions are rejected at startup. There
   is no per-tool protocol boilerplate; the server is already Game Forge.
@@ -523,13 +525,43 @@ MCP client --stdio--> game-forge mcp serve --daemon client--> game-forged
   cwd, or `--cwd <dir>`; it lives in the envelope, never inside `args`. Two
   `mcp serve` instances with different cwd stay project-isolated through the
   daemon's project-keyed resource model.
-- Results map to `structuredContent` (the canonical operation result, compact
-  JSON as the text fallback); failures become `isError` results carrying the
+- Results map to `structuredContent` (the authoritative canonical operation
+  result); failures become `isError` results carrying the
   canonical `code`/`path`/`msg`. Semantic stage/artifact events become MCP
   progress notifications when the client supplied a progress token; MCP
   cancellation propagates to the daemon request and cancels the Core operation
   without harming reusable owned resources.
 - Artifacts stay referenced (`kind`, `ref`, `path`), never inlined.
+
+### MCP efficiency contract
+
+The interface is consumed by coding agents, so wire efficiency is part of
+correctness — the same discipline as "no second Runtime":
+
+- **Initialization**: one `/v1/catalog` request (protocol identity included),
+  not one schema request per operation.
+- **Model surface**: `tools/list` carries name + description + input schema.
+  Output schemas are omitted by default — the daemon still validates every
+  result canonically, and a model needs input shape, not result shape, to
+  choose and call a tool. `--full-schemas` re-enables them for clients that
+  validate structured results.
+- **Compact schema projection**: advertised schemas are the canonical
+  documents minus `$schema`/`$id` — wire metadata with no validation
+  semantics. The projection is deterministic and derived, never a second
+  handwritten schema; a document containing `$ref` is left untouched because
+  `$id` participates in resolution there.
+- **No duplicated results**: compact mode returns `structuredContent` with an
+  empty `content` array (standards-valid). `--compat-text` opts into mirroring
+  the JSON for clients that predate `structuredContent`.
+- **Dense errors/progress**: errors stay `code: msg (path)` capped at 512 B;
+  identical consecutive progress notifications are suppressed and messages
+  capped; artifacts never inline bytes.
+- **Budget**: `internal/mcpfrontend/efficiency-budget.json` holds named limits
+  (catalog/model-surface bytes, per-tool and average size, init requests,
+  latency ceilings, representative call results). `game-forge mcp audit`
+  measures the real serialized surface against it; `--json` feeds CI. The
+  file is never auto-rebaselined — a raised limit needs a justification in
+  the commit.
 
 Out of scope for now: MCP resources/prompts, remote/HTTP MCP, OAuth, public
 listeners. A future resource layer can expose artifacts more richly over the

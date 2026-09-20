@@ -201,14 +201,12 @@ func renderScenarioCompare(w io.Writer, data json.RawMessage) int {
 		return ExitFail
 	}
 	for _, r := range d.Results {
-		mark := "MATCH"
-		if !r.Match {
-			mark = "DIFF"
+		if r.Match {
+			fmt.Fprintf(w, "%-6s %-22s digest=%s\n", "MATCH", r.ID, r.Digest)
+			continue
 		}
-		fmt.Fprintf(w, "%-6s %-22s headless=%s browser=%s digest=%s\n", mark, r.ID, r.Headless, r.Browser, r.Digest)
-		if !r.Match {
-			fmt.Fprintf(w, "       %s\n", r.Explanation)
-		}
+		fmt.Fprintf(w, "%-6s %-22s headless=%s browser=%s\n", "DIFF", r.ID, r.Headless, r.Browser)
+		fmt.Fprintf(w, "       %s\n", r.Explanation)
 	}
 	fmt.Fprintf(w, "compared %d scenarios, %d differing\n", d.Compared, d.Differing)
 	if d.Differing > 0 {

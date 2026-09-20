@@ -279,6 +279,7 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.auth(s.handleHealth))
 	mux.HandleFunc("/v1/capabilities", s.auth(s.handleCapabilities))
+	mux.HandleFunc("/v1/catalog", s.auth(s.handleCatalog))
 	mux.HandleFunc("/v1/schema/", s.auth(s.handleSchema))
 	mux.HandleFunc("/v1/run", s.auth(s.handleRun))
 	mux.HandleFunc("/v1/shutdown", s.auth(s.handleShutdown))
@@ -312,6 +313,30 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"v":   schemas.Version,
 		"ops": s.reg.Names(),
+	})
+}
+
+// handleCatalog returns every operation's full contract in ONE response so a
+// frontend (the MCP server) can initialize without N per-schema round trips.
+// The per-operation /v1/schema/<op> endpoint remains for debugging.
+func (s *Server) handleCatalog(w http.ResponseWriter, _ *http.Request) {
+	ops := make([]map[string]any, 0, s.reg.Len())
+	for _, o := range s.reg.All() {
+		var in, out any
+		_ = json.Unmarshal(o.InputSchema(), &in)
+		_ = json.Unmarshal(o.OutputSchema(), &out)
+		ops = append(ops, map[string]any{
+			"op":      o.Name,
+			"summary": o.Summary,
+			"stream":  o.Stream,
+			"input":   in,
+			"output":  out,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"v":        schemas.Version,
+		"protocol": Protocol,
+		"ops":      ops,
 	})
 }
 

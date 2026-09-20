@@ -124,7 +124,9 @@ game-forge gc                  # reclaim expired owned resources
 game-forge tick                # one idempotent housekeeping pass
 
 game-forge daemon status|stop|restart  # control the per-user daemon
-game-forge mcp serve [--cwd DIR]         # expose Game Forge over MCP stdio
+game-forge mcp serve [--cwd DIR] [--compat-text] [--full-schemas]
+                                       # expose Game Forge over MCP stdio
+game-forge mcp audit [--json]          # MCP wire-efficiency surface vs budget
 
 game-forge version
 game-forge help

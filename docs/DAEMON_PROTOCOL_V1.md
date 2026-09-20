@@ -78,7 +78,8 @@ semantic namespace, so there is no large REST hierarchy.
 |---|---|---|
 | `GET`  | `/health` | Liveness. `{ok, v, protocol, pid}`. |
 | `GET`  | `/v1/capabilities` | `{v, ops:[names]}`. |
-| `GET`  | `/v1/schema/<op>` | One operation's contract: `{op, summary, stream, input, output}`. |
+| `GET`  | `/v1/catalog` | Every operation's contract in ONE response: `{v, protocol, ops:[{op, summary, stream, input, output}]}`. Frontends initialize from it without N per-schema round trips. |
+| `GET`  | `/v1/schema/<op>` | One operation's contract: `{op, summary, stream, input, output}`. Kept for debugging/external clients. |
 | `POST` | `/v1/run` | Execute one operation (JSON or NDJSON). |
 | `POST` | `/v1/shutdown` | Graceful stop. |
 

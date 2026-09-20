@@ -10,10 +10,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rceman/game-forge/internal/daemon"
@@ -32,13 +34,30 @@ type Client struct {
 	// the daemon discovers the right project. Defaults to the process cwd; a
 	// frontend (the MCP server) may pin it via WithCwd.
 	cwd string
+	// reqs counts daemon HTTP requests. It is a pointer so WithCwd copies share
+	// the counter — the audit measures frontend round trips regardless of how
+	// many lightweight client clones wrap the same daemon connection.
+	reqs *atomic.Int64
 }
 
 // NewClient returns a client for a known daemon. It is used by tests and by
 // frontends that already hold discovery state; Connect/Ensure are the normal
 // entry points.
 func NewClient(d *daemon.Discovery, cwd string) *Client {
-	return &Client{d: d, hc: &http.Client{Timeout: 30 * time.Second}, streamHC: &http.Client{}, cwd: cwd}
+	return &Client{
+		d: d, hc: &http.Client{Timeout: 30 * time.Second}, streamHC: &http.Client{},
+		cwd: cwd, reqs: &atomic.Int64{},
+	}
+}
+
+// Requests returns the number of daemon HTTP requests this client (and every
+// WithCwd clone of it) has made. Audits use it to gate frontend round trips.
+func (c *Client) Requests() int64 { return c.reqs.Load() }
+
+// do performs one daemon request and counts it.
+func (c *Client) do(hc *http.Client, req *http.Request) (*http.Response, error) {
+	c.reqs.Add(1)
+	return hc.Do(req)
 }
 
 // WithCwd returns a client identical to c but pinning the request cwd.
@@ -80,7 +99,7 @@ func (c *Client) healthy(ctx context.Context) bool {
 		return false
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return false
 	}
@@ -106,7 +125,7 @@ func (c *Client) Run(ctx context.Context, opName string, args any) (json.RawMess
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeFailed, Msg: "daemon request: " + err.Error()}
 	}
@@ -136,7 +155,7 @@ func (c *Client) Stream(ctx context.Context, opName string, args any, onEvent fu
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/x-ndjson")
-	resp, err := c.streamHC.Do(req)
+	resp, err := c.do(c.streamHC, req)
 	if err != nil {
 		return nil, &op.Error{Code: op.CodeFailed, Msg: "daemon request: " + err.Error()}
 	}
@@ -189,7 +208,7 @@ func (c *Client) Capabilities(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +229,7 @@ func (c *Client) Shutdown(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return err
 	}
@@ -236,12 +255,54 @@ func (c *Client) Schema(ctx context.Context, opName string) (*OpSchema, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	var v OpSchema
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// Catalog is the daemon's whole operation contract served in ONE response by
+// GET /v1/catalog. A frontend initializes from it instead of performing one
+// schema request per operation; it also carries the protocol identity needed
+// for the compatibility check.
+type Catalog struct {
+	V        int        `json:"v"`
+	Protocol string     `json:"protocol"`
+	Ops      []OpSchema `json:"ops"`
+}
+
+// Catalog returns the daemon's full operation catalog.
+func (c *Client) Catalog(ctx context.Context) (*Catalog, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.d.Endpoint+"/v1/catalog", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.d.Token)
+	resp, err := c.do(c.hc, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// A catalog-less daemon predates the batched catalog endpoint; it is
+		// too old to serve this frontend's contract discovery.
+		return nil, fmt.Errorf("game-forged is too old to serve /v1/catalog — run: game-forge daemon restart")
+	}
+	if resp.StatusCode != http.StatusOK {
+		var reply op.Response
+		_ = json.NewDecoder(resp.Body).Decode(&reply)
+		if reply.Err != nil {
+			return nil, reply.Err
+		}
+		return nil, fmt.Errorf("catalog: daemon status %d", resp.StatusCode)
+	}
+	var v Catalog
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
 		return nil, err
 	}
@@ -264,7 +325,7 @@ func (c *Client) HealthCheck(ctx context.Context) (*Health, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.d.Token)
-	resp, err := c.hc.Do(req)
+	resp, err := c.do(c.hc, req)
 	if err != nil {
 		return nil, err
 	}

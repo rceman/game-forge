@@ -162,10 +162,12 @@ func TestToolSchemaIsCanonical(t *testing.T) {
 	if strict == nil {
 		t.Fatal("test_strict tool missing")
 	}
-	// The exposed input schema must equal the canonical operation schema.
+	// The exposed input schema must equal the deterministic compact
+	// projection of the canonical operation schema — validation-relevant
+	// semantics preserved, wire metadata ($schema/$id) removed.
 	got, _ := json.Marshal(strict.InputSchema)
 	var want map[string]any
-	json.Unmarshal(meta.Input, &want)
+	json.Unmarshal(compactSchema(meta.Input), &want)
 	var gotM map[string]any
 	json.Unmarshal(got, &gotM)
 	if !jsonEqual(want, gotM) {

@@ -255,7 +255,7 @@ type scenarioRunArgs struct {
 type checkOut struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type scenarioRunOut struct {
@@ -388,12 +388,15 @@ type compareOut struct {
 	Results   []compareRow `json:"results"`
 }
 
+// compareRow is one scenario's headless-vs-browser outcome. A match reports
+// the shared digest once; a mismatch reports both digests and the reason —
+// the three identical digest strings are never repeated on a match.
 type compareRow struct {
 	ID          string `json:"id"`
 	Match       bool   `json:"match"`
-	Headless    string `json:"headless"`
-	Browser     string `json:"browser"`
-	Digest      string `json:"digest"`
+	Digest      string `json:"digest,omitempty"`
+	Headless    string `json:"headless,omitempty"`
+	Browser     string `json:"browser,omitempty"`
 	Explanation string `json:"explanation,omitempty"`
 }
 
@@ -457,7 +460,14 @@ func (rt *Runtime) scenarioCompare(ctx context.Context, raw json.RawMessage, sin
 			sink.Stage("compare."+id, op.StatusFail, ms(start), "")
 			continue
 		}
-		row := compareRow{ID: res.ID, Match: res.Match, Headless: res.Headless, Browser: res.Browser, Digest: res.Digest, Explanation: res.Explanation}
+		row := compareRow{ID: res.ID, Match: res.Match, Explanation: res.Explanation}
+		if res.Match {
+			// One digest is the whole story on a match.
+			row.Digest = res.Digest
+		} else {
+			row.Headless = res.Headless
+			row.Browser = res.Browser
+		}
 		out.Results = append(out.Results, row)
 		if !res.Match {
 			out.Differing++

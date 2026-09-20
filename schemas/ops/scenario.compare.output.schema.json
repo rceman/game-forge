@@ -10,13 +10,13 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "match", "headless", "browser", "digest"],
+        "required": ["id", "match"],
         "properties": {
           "id": { "type": "string" },
           "match": { "type": "boolean" },
+          "digest": { "type": "string" },
           "headless": { "type": "string" },
           "browser": { "type": "string" },
-          "digest": { "type": "string" },
           "explanation": { "type": "string" }
         },
         "additionalProperties": false

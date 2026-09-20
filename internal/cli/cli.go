@@ -188,6 +188,7 @@ Daemon:
 
 MCP:
   mcp serve [--cwd DIR]        Serve MCP over stdio (for MCP-capable agents)
+  mcp audit [--json]           Measure the MCP efficiency surface vs budget
 
 Other:
   version                      Print the Game Forge version

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,13 +15,18 @@ import (
 )
 
 // cmdMCP owns the MCP frontend. `mcp serve` speaks MCP over stdio — stdout is
-// the protocol channel, so every diagnostic goes to stderr.
+// the protocol channel, so every diagnostic goes to stderr. `mcp audit`
+// measures the MCP efficiency surface against the checked-in budget.
 func cmdMCP(args []string) int {
-	if first(args) != "serve" {
-		fmt.Fprintln(os.Stderr, "game-forge mcp: expected subcommand (serve)")
+	switch first(args) {
+	case "serve":
+		return mcpServe(args[1:])
+	case "audit":
+		return mcpAudit(args[1:])
+	default:
+		fmt.Fprintln(os.Stderr, "game-forge mcp: expected subcommand (serve, audit)")
 		return ExitUsage
 	}
-	return mcpServe(args[1:])
 }
 
 // mcpServe runs the stdio MCP frontend. It pins one project cwd — the process
@@ -33,10 +39,24 @@ func mcpServe(args []string) int {
 		fmt.Fprintf(os.Stderr, "game-forge mcp serve: %v\n", err)
 		return ExitFail
 	}
+	var opt mcpfrontend.Options
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--cwd" && i+1 < len(args) {
-			cwd = args[i+1]
-			i++
+		switch args[i] {
+		case "--cwd":
+			if i+1 < len(args) {
+				cwd = args[i+1]
+				i++
+			}
+		case "--compat-text":
+			// Mirror the full JSON result into TextContent for MCP clients
+			// that predate structuredContent. Off by default: the structured
+			// result is authoritative and duplicating it doubles context cost.
+			opt.CompatText = true
+		case "--full-schemas":
+			// Advertise canonical output schemas in tools/list. Off by
+			// default: name + description + input schema are what a model
+			// needs to choose and call a tool.
+			opt.FullSchemas = true
 		}
 	}
 	ctx := context.Background()
@@ -46,7 +66,7 @@ func mcpServe(args []string) int {
 		return ExitFail
 	}
 	mcpfrontend.Version = Version
-	fe, err := mcpfrontend.New(ctx, cl, cwd)
+	fe, err := mcpfrontend.NewWithOptions(ctx, cl, cwd, opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forge mcp serve: %v\n", err)
 		return ExitFail
@@ -56,4 +76,41 @@ func mcpServe(args []string) int {
 		return ExitFail
 	}
 	return ExitOK
+}
+
+// mcpAudit measures the MCP efficiency contract — catalog size, model surface,
+// initialization round trips and latency — against the checked-in budget. It
+// is metadata-only: it never invokes a tool, so no browser, dev server or GPU
+// probe is started and no project is required.
+func mcpAudit(args []string) int {
+	var asJSON bool
+	for _, a := range args {
+		if a == "--json" {
+			asJSON = true
+		}
+	}
+	ctx := context.Background()
+	cl, err := client.Ensure(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "game-forge mcp audit: %v\n", err)
+		return ExitFail
+	}
+	rep, err := mcpfrontend.Audit(ctx, cl)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "game-forge mcp audit: %v\n", err)
+		return ExitFail
+	}
+	if asJSON {
+		data, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "game-forge mcp audit: %v\n", err)
+			return ExitFail
+		}
+		fmt.Fprintln(os.Stdout, string(data))
+		if rep.Status == "PASS" {
+			return ExitOK
+		}
+		return ExitFail
+	}
+	return rep.Render(os.Stdout)
 }
