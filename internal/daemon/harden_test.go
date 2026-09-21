@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rceman/game-forge/internal/op"
 )
@@ -140,13 +141,21 @@ func TestRequestIDAssigned(t *testing.T) {
 // is recovered.
 func TestLifetimeLockSingleton(t *testing.T) {
 	t.Setenv("GAME_FORGE_HOME", t.TempDir())
+	old := ownershipWait
+	ownershipWait = 300 * time.Millisecond
+	t.Cleanup(func() { ownershipWait = old })
 	release, err := acquireLifetimeLock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A second acquirer sees a live owner and fails.
+	// A second acquirer waits for the live owner to release, then fails the
+	// bounded wait — it never steals the lock while the owner holds it.
+	start := time.Now()
 	if _, err := acquireLifetimeLock(); err == nil {
 		t.Fatal("second daemon acquired the lifetime lock while owner is alive")
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("bounded ownership wait exceeded")
 	}
 	// Releasing frees ownership.
 	release()

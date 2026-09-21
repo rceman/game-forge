@@ -14,6 +14,7 @@ import (
 	"os"
 
 	"github.com/rceman/game-forge/internal/client"
+	"github.com/rceman/game-forge/internal/lifecycle"
 	"github.com/rceman/game-forge/internal/op"
 )
 
@@ -40,6 +41,14 @@ func Run(args []string) int {
 	case "version", "-v", "--version":
 		fmt.Printf("game-forge %s\n", Version)
 		return ExitOK
+	case "start":
+		return cmdStart()
+	case "stop":
+		return cmdStop()
+	case "restart":
+		return cmdRestart()
+	case "status":
+		return cmdStatus()
 	case "daemon":
 		return cmdDaemon(args[1:])
 	case "mcp":
@@ -64,7 +73,7 @@ func Run(args []string) int {
 // runCall ensures the daemon, sends the operation and renders the result.
 func runCall(c *call) int {
 	ctx := context.Background()
-	cl, err := client.Ensure(ctx)
+	cl, err := lifecycle.Ensure(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forge: %v\n", err)
 		return ExitFail
@@ -166,6 +175,12 @@ Ordinary commands run through the local Game Forge daemon, which is started
 automatically. Most support --json for a structured result and --ndjson for
 the raw event stream.
 
+Game Forge:
+  start                        Ensure Game Forge is running
+  stop                         Stop Game Forge cleanly
+  restart                      Replace the running incarnation cleanly
+  status                       Show whether Game Forge is running
+
 Project:
   project info                 Show the nearest project manifest
   project add <code>           Register the current project under a stable code
@@ -192,11 +207,12 @@ Resources:
   gc                           Reclaim expired owned resources
   tick                         One idempotent housekeeping pass
 
-Daemon:
-  daemon status                Show the running daemon
-  daemon stop                  Stop the daemon gracefully
-  daemon restart               Restart the daemon
+Advanced / service administration:
+  daemon serve                 Run the daemon worker in the foreground
+  daemon install               Install the per-user service (autostart)
+  daemon uninstall             Remove the service registration (state kept)
   daemon rebind                Pick a new durable port (MCP endpoint changes)
+  daemon start|stop|restart|status   Aliases for the lifecycle commands
 
 MCP:
   mcp info [--json] [--show-token]  Show the canonical MCP endpoint

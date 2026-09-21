@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -97,9 +98,17 @@ func (s *Server) nextID(prefix string) string {
 	return fmt.Sprintf("%s_%s_%d", prefix, s.incarnation, s.runSeq.Add(1))
 }
 
+// ownershipWait bounds how long a new incarnation waits for a previous daemon
+// to finish draining (resource release happens after the listener closes, so
+// a predecessor can hold ownership while already unreachable). It is a var so
+// tests can shrink it.
+var ownershipWait = 35 * time.Second
+
 // acquireLifetimeLock claims daemon ownership for this process's lifetime.
 // The file carries the owning pid so a crashed daemon's stale lock is
-// recovered rather than waited on forever.
+// recovered rather than waited on forever. A live holder means a predecessor
+// is either healthy or mid-shutdown — the worker waits for it to relinquish
+// ownership instead of racing a half-drained daemon.
 func acquireLifetimeLock() (func(), error) {
 	path, err := OwnedLockPath()
 	if err != nil {
@@ -108,7 +117,8 @@ func acquireLifetimeLock() (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	for tries := 0; tries < 20; tries++ {
+	deadline := time.Now().Add(ownershipWait)
+	for {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			fmt.Fprintf(f, "%d\n", os.Getpid())
@@ -120,16 +130,39 @@ func acquireLifetimeLock() (func(), error) {
 		if !os.IsExist(err) {
 			return nil, err
 		}
-		// The lock exists: a live owner means another daemon is genuinely
-		// running; a dead one leaves a stale file we reclaim.
+		// The lock exists: a dead owner leaves a stale file we reclaim; a live
+		// one is draining and we wait for it to release ownership.
 		data, _ := os.ReadFile(path)
 		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-		if pid > 0 && processAlive(pid) {
-			return nil, fmt.Errorf("game-forged already running (pid %d)", pid)
+		if pid <= 0 || !processAlive(pid) {
+			_ = os.Remove(path)
+			continue
 		}
-		_ = os.Remove(path)
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for game-forged (pid %d) to release ownership", pid)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return nil, fmt.Errorf("could not claim daemon ownership")
+}
+
+// OwnershipFree reports whether no daemon incarnation currently holds the
+// lifetime ownership lock — the authoritative "previous daemon is gone"
+// signal for stop/restart, since the endpoint closes before resource drain
+// completes.
+func OwnershipFree() bool {
+	path, err := OwnedLockPath()
+	if err != nil {
+		return true
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	return pid <= 0 || !processAlive(pid)
 }
 
 // Serve binds the durable loopback port, writes discovery state, runs startup
@@ -176,6 +209,19 @@ func (s *Server) Serve() error {
 	s.reconcile()
 
 	go s.housekeeping()
+
+	// Service managers stop the daemon with SIGTERM (systemd stop/restart);
+	// map it to the same graceful shutdown as /v1/shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, stopSignals()...)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			s.Stop()
+		case <-s.done:
+		}
+	}()
 
 	srv := &http.Server{Handler: s.routes()}
 	errCh := make(chan error, 1)

@@ -509,14 +509,35 @@ The daemon owns periodic housekeeping: an in-process loop calls the same Core
 `Tick` that `game-forge tick` exposes, reclaiming expired owned resources while
 skipping resources whose run is in-flight. It never shells out to the binary.
 
-Daemon lifecycle commands:
+### Ownership and lifecycle
 
-```text
-game-forge daemon status
-game-forge daemon stop
-game-forge daemon restart
-game-forge daemon rebind   # choose a new durable port (MCP endpoint changes)
-```
+One daemon incarnation owns control at a time, enforced by the lifetime lock
+`run/daemon-owned.lock` (carries the owner pid). The endpoint closes before
+resource drain finishes, so "not answering" is not "gone": a new incarnation
+waits for the predecessor to release ownership rather than racing a
+half-drained daemon, and `stop` returns only after the lock is released. That
+is what makes `restart` and `stop`+`start` deterministic.
+
+Human-facing commands — `game-forge start|stop|restart|status` — route through
+`internal/lifecycle`: when a native service is installed they talk to the
+service manager, otherwise they manage a detached `daemon serve` spawn. The
+`daemon` subcommands are the administrative interface (`daemon serve` is the
+worker itself; `daemon start|stop|restart|status` are aliases).
+
+`internal/service` is the service-manager seam. The Linux/WSL backend installs
+`~/.config/systemd/user/game-forged.service` — `Type=simple`,
+`ExecStart=<abs path> daemon serve`, `Restart=on-failure`,
+`WantedBy=default.target`. The worker stays attached to systemd as the service
+process (no forking, no self-management); SIGTERM maps to the same graceful
+shutdown as `/v1/shutdown`. Install refreshes the unit in place, so a rebuilt
+or moved binary updates `ExecStart` without duplicating units. Uninstall
+stops/disables/removes the unit and preserves durable state. Platforms without
+a backend fail install with a clear unsupported message; detached fallback
+keeps `game-forge start` working everywhere.
+
+Autostart scope: an enabled user unit starts when the user's systemd
+environment comes up. Under WSL that is when the distribution's systemd/user
+environment starts — Windows login alone does not launch the WSL VM.
 
 See `DAEMON_PROTOCOL_V1.md` for the wire contract.
 

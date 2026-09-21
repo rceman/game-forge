@@ -13,6 +13,7 @@ import (
 
 	"github.com/rceman/game-forge/internal/client"
 	"github.com/rceman/game-forge/internal/daemon"
+	"github.com/rceman/game-forge/internal/lifecycle"
 	"github.com/rceman/game-forge/internal/mcpfrontend"
 	"github.com/rceman/game-forge/internal/op"
 	"github.com/rceman/game-forge/internal/project"
@@ -79,7 +80,7 @@ func mcpServe(args []string) int {
 		}
 	}
 	ctx := context.Background()
-	cl, err := client.Ensure(ctx)
+	cl, err := lifecycle.Ensure(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forge mcp serve: %v\n", err)
 		return ExitFail
@@ -177,7 +178,7 @@ func mcpAudit(args []string) int {
 		}
 	}
 	ctx := context.Background()
-	cl, err := client.Ensure(ctx)
+	cl, err := lifecycle.Ensure(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forge mcp audit: %v\n", err)
 		return ExitFail

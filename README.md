@@ -123,7 +123,9 @@ game-forge ps                  # list resources owned by Game Forge
 game-forge gc                  # reclaim expired owned resources
 game-forge tick                # one idempotent housekeeping pass
 
-game-forge daemon status|stop|restart|rebind  # control the per-user daemon
+game-forge start|stop|restart|status  # human-facing service lifecycle
+game-forge daemon install|uninstall   # per-user autostart (systemd --user)
+game-forge daemon serve|rebind        # worker process / port recovery
 game-forge mcp info [--json] [--show-token]    # the canonical MCP endpoint
 game-forge mcp serve                           # stdio compatibility frontend
 game-forge mcp audit [--json]                  # MCP wire-efficiency vs budget
@@ -189,6 +191,23 @@ explicit per-machine choice; the default stays compact.
 
 `mcp serve` remains as a stdio compatibility frontend over the same daemon
 and the same per-call `project_code` routing.
+
+## Lifecycle
+
+`game-forge start|stop|restart|status` are the human-facing lifecycle
+commands; their meaning is the same whether or not a native service is
+installed. Without one, `start` spawns a detached `daemon serve` and waits for
+health. On Linux/WSL with a working `systemd --user`, `game-forge daemon
+install` writes `~/.config/systemd/user/game-forged.service` pointing at the
+current binary, enables it, and hands lifecycle to systemd — `stop`/`restart`
+then go through `systemctl --user`, crashes are restarted by
+`Restart=on-failure`, and `daemon uninstall` removes the unit while keeping
+the registry, port and credentials.
+
+Autostart boundary: an enabled unit starts when the user's systemd
+environment comes up. On WSL that means once the distribution's systemd/user
+environment starts — Windows login alone does not launch the WSL VM, so
+WSL-side autostart only proves out after WSL itself is running.
 
 Most commands accept `--json` for a structured result and `--ndjson` for the
 raw event stream. Ordinary commands transparently start and reuse the daemon;
