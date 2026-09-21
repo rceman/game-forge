@@ -51,6 +51,20 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !got.Browser.AgentBrowser.Headless {
 		t.Error("headless should persist as true")
 	}
+	if got.MCP.CompatText {
+		t.Error("compat_text must default to false")
+	}
+	c.MCP.CompatText = true
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !got.MCP.CompatText {
+		t.Error("compat_text = true should persist")
+	}
 }
 
 func TestLoadRejectsUnsupportedVersion(t *testing.T) {

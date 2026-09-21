@@ -181,6 +181,12 @@ visual_shot(project_code="TDG", case="starting-tower")
 If the persisted port is ever occupied at startup the daemon fails loudly —
 run `game-forge daemon rebind` to choose a new port deliberately (MCP client
 config then points at the new endpoint; the port never moves silently).
+
+By default `/mcp` returns results as `structuredContent` only (compact mode).
+If a client cannot consume `structuredContent`, opt that machine into text
+mirroring with `mcp.compat_text: true` in `~/.game-forge/config.yaml` — an
+explicit per-machine choice; the default stays compact.
+
 `mcp serve` remains as a stdio compatibility frontend over the same daemon
 and the same per-call `project_code` routing.
 

@@ -20,6 +20,16 @@ const CurrentVersion = 1
 type Config struct {
 	Version int     `yaml:"version"`
 	Browser Browser `yaml:"browser"`
+	MCP     MCP     `yaml:"mcp"`
+}
+
+// MCP tunes the daemon's /mcp endpoint for the harness on this machine.
+type MCP struct {
+	// CompatText mirrors every successful result's JSON into TextContent.
+	// Default false keeps compact mode (structuredContent only). Set true on
+	// machines whose MCP client consumes content but not structuredContent —
+	// an explicit per-machine opt-in, never a silent default change.
+	CompatText bool `yaml:"compat_text"`
 }
 
 // Browser selects and configures the browser provider.

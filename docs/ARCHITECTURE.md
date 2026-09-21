@@ -583,7 +583,10 @@ correctness — the same discipline as "no second Runtime":
   `$id` participates in resolution there.
 - **No duplicated results**: compact mode returns `structuredContent` with an
   empty `content` array (standards-valid). `--compat-text` opts into mirroring
-  the JSON for clients that predate `structuredContent`.
+  the JSON for clients that predate `structuredContent`; the daemon endpoint
+  offers the same opt-in via `mcp.compat_text: true` in
+  `~/.game-forge/config.yaml`, so a machine's harness chooses once rather than
+  every transport defaulting to duplication.
 - **Dense errors/progress**: errors stay `code: msg (path)` capped at 512 B;
   identical consecutive progress notifications are suppressed and messages
   capped; artifacts never inline bytes.

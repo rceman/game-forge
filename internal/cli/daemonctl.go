@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/rceman/game-forge/internal/client"
+	"github.com/rceman/game-forge/internal/config"
 	"github.com/rceman/game-forge/internal/core"
 	"github.com/rceman/game-forge/internal/daemon"
 	"github.com/rceman/game-forge/internal/mcpfrontend"
@@ -69,7 +70,13 @@ func daemonServe() int {
 	// the same pipeline as /v1/run, and the daemon package stays free of the
 	// frontend (no import cycle).
 	mcpfrontend.Version = Version
-	mcpH, err := mcpfrontend.HTTPHandler(srv, mcpfrontend.Options{})
+	var mcpOpt mcpfrontend.Options
+	if cfg, _, err := config.LoadDefault(); err == nil {
+		// mcp.compat_text is the machine-level opt-in for MCP clients that
+		// consume content but not structuredContent (e.g. this harness).
+		mcpOpt.CompatText = cfg.MCP.CompatText
+	}
+	mcpH, err := mcpfrontend.HTTPHandler(srv, mcpOpt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "game-forged: mount MCP: %v\n", err)
 		return ExitFail
